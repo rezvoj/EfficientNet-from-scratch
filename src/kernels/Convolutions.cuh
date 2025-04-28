@@ -1,34 +1,33 @@
 
-// TODO
-
-
-// Standard Conv:
-// (n, c_in, h, w) ⊗ (c_out, c_in, h_ker, w_ker) = (n, c_out, h_out, w_out)
-// (c_out, batch * h_out * w_out) = (c_out, c_in * h_ker * w_ker) @ (c_in * h_ker * w_ker, batch * h_out * w_out)
-
-// Backwards to calc kernel grad:
-// (c_out, c_in * h_ker * w_ker) = (c_out, batch * h_out * w_out) @ (batch * h_out * w_out, c_in * h_ker * w_ker)
-
-// Depthwise Conv - to calc kernel grad:
-// (c, 1, h_ker * w_ker) = (c, 1, batch * h_out * w_out) @ (c, batch * h_out * w_out, h_ker * w_ker)
-
-
-
-
-
-// INVERTED WITH SKIPS INTO THE TENSOR + channelSwap the kernel / invert the kernel
-// (n, c_out, h_out, w_out) ⊗ (c_in, c_out, h_ker_180, w_ker_180) = (n, c_in, h, w)
-// (C_in, C_out * K_180 * K_180) @ (C_out * K * K, N * H_in * W_in) = (C_in, N * H_in * W_in)
-
-
-
-
-// (patch, pos)
-// from (2nd)
-//  -> (c_in * h_ker * w_ker, batch * h_out * w_out)
-// to
-// (C_out, batch, h_out * w_out) -> (C_out * K * K, batch * h_in * w_in)
-    // h_in >= h_out
+template <uint KERNEL_SIZE>
+__global__ void im2colInvertKernel(
+        float* __restrict__ tensorOut,
+        const float* __restrict__ tensorIn,
+        const uint chanInSize,
+        const uint chanOutSize,
+        const uint totalSize) {
+    constexpr uint YX_SIZE_PROD = KERNEL_SIZE * KERNEL_SIZE;
+    // Calculate base index and check bounds
+    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tIdx >= totalSize) return;
+    // Deconstruct the flat output index
+    const uint chanOutYXSizeProd = chanOutSize * YX_SIZE_PROD;
+    const uint chanInIdx = tIdx / chanOutYXSizeProd;
+    const uint leftoverIdx = tIdx % chanOutYXSizeProd;
+    const uint chanOutIdx = leftoverIdx / YX_SIZE_PROD;
+    leftoverIdx = leftoverIdx % YX_SIZE_PROD;
+    const uint yIdx = leftoverIdx / KERNEL_SIZE;
+    const uint xIdx = leftoverIdx % KERNEL_SIZE;
+    // Calculate inverted y and x indexes
+    const uint invrtYIdx = KERNEL_SIZE - yIdx - 1;
+    const uint invrtXIdx = KERNEL_SIZE - xIdx - 1;
+    // Construct the input flat index parts
+    const uint chanOutchanInIdx = chanOutIdx * chanInSize + chanInIdx;
+    const uint chanOutchanInIdxPart = chanOutchanInIdx * YX_SIZE_PROD;
+    const uint inYXIdx = invrtYIdx * KERNEL_SIZE + invrtXIdx;
+    // Copy value from input to its corresponding output cell
+    tensorOut[tIdx] = tensorIn[chanOutchanInIdxPart + inYXIdx];
+}
 
 
 template <uint STRIDE, uint KERNEL_SIZE>
@@ -38,8 +37,6 @@ __global__ void im2colConvBackwardInverted(
         const uint posYSize,
         const uint posXSize,
         const uint posSize,
-        // const uint patchYXSizeProd, -> PATCH_YX_SIZE_PROD
-        // const uint patchXSize, -> KERNEL_SIZE
         const uint patchSize,
         const uint inBatchSize,
         const uint inYSize,
@@ -57,34 +54,32 @@ __global__ void im2colConvBackwardInverted(
     const int relativePosYIdx = posYXIdx / posXSize - (posYSize - 1) / 2;
     const int relativePosXIdx = posYXIdx % posXSize - (posXSize - 1) / 2;
 
-    const uint chanIdx = patchIdx / PATCH_YX_SIZE_PROD;
-    const uint batchIdx = posIdx / posYXSizeProd;
+    const uint patchChanIdx = patchIdx / PATCH_YX_SIZE_PROD;
+    const uint posBatchIdx = posIdx / posYXSizeProd;
 
     const uint patchYXIdx = patchIdx % PATCH_YX_SIZE_PROD;
     const uint patchYIdx = patchYXIdx / KERNEL_SIZE;
     const uint patchXIdx = patchYXIdx % KERNEL_SIZE;
 
-    // anchor and point in OUT DOMAIN
-
-    const uint inAnchorYIdx = patchYIdx * STRIDE;
-    const uint inAnchorXIdx = patchXIdx * STRIDE;
-
-    const int inPointYIdx = inAnchorYIdx + relativePosYIdx;
-    const int inPointXIdx = inAnchorXIdx + relativePosXIdx;
-
-
-
-
+    const int pointYIdx = patchYIdx + relativePosYIdx;
+    const int pointXIdx = patchXIdx + relativePosXIdx;
 
     float pointValue = 0.0f;
-    if (inPointYIdx >= 0 && inPointYIdx < inYSize 
-            && inPointXIdx >= 0 && inPointXIdx < inXSize) {
-        // Construct [C,B,H,W] input index
-        const uint inYXSizeProd = inYSize * inXSize;
-        const uint inChanIdxPart = chanIdx * inBatchSize * inYXSizeProd;
-        const uint inBatchIdxPart = batchIdx * inYXSizeProd;
-        const uint inYXIdxPart = inPointYIdx * inXSize + inPointXIdx;
-        pointValue = tensorIn[inChanIdxPart + inBatchIdxPart + inYXIdxPart];
+    if (!(pointYIdx % STRIDE) && !(pointXIdx % STRIDE)) {
+        // Calculate input y and x indexes for point
+        const int inPointYIdx = pointYIdx / STRIDE;
+        const int inPointXIdx = pointXIdx / STRIDE;
+        // Check bounds for the input tensor
+        if (inPointYIdx >= 0 && inPointYIdx < inYSize
+                && inPointXIdx >= 0 && inPointXIdx < inXSize) {
+            // Construct [C,B,H,W] input index
+            const uint inYXSizeProd = inYSize * inXSize;
+            const uint inChanIdxPart = patchChanIdx * inBatchSize * inYXSizeProd;
+            const uint inBatchIdxPart = posBatchIdx * inYXSizeProd;
+            const uint inYXIdxPart = inPointYIdx * inXSize + inPointXIdx;
+            // Load the corresponding point value from the input tensor
+            pointValue = tensorIn[inChanIdxPart + inBatchIdxPart + inYXIdxPart];
+        }
     }
     tensorOut[tIdx] = pointValue
 }
@@ -149,29 +144,25 @@ __global__ void im2colConv(
 }
 
 
-// TEMPLATE: pos -> KERNEL_SIZE
-// (c, 1, h_ker * w_ker) = (c, 1, batch * h_out * w_out) @ (c, batch * h_out * w_out, h_ker * w_ker)
-template <uint STRIDE>
+template <uint STRIDE, uint KERNEL_SIZE>
 __global__ void im2colConvDepthwiseBackward(
         float* __restrict__ tensorOut,
         const float* __restrict__ tensorIn,
-        const uint posYSize,
-        const uint posXSize,
         const uint patchYXSizeProd,
         const uint patchXSize,
         const uint patchSize,
         const uint inYSize,
         const uint inXSize) {
     // Calculate base indexes and check bounds
-    const uint posYXSizeProd = posYSize * posXSize;
+    const uint POS_SIZE = KERNEL_SIZE * KERNEL_SIZE;
     
     const uint posIdx = blockIdx.x * blockDim.x + threadIdx.x;
     const uint patchIdx = blockIdx.y * blockDim.y + threadIdx.y;
-    if (posIdx >= posYXSizeProd || patchIdx >= patchSize) return;
-    const uint tIdx = patchIdx * posYXSizeProd + posIdx;
+    if (posIdx >= POS_SIZE || patchIdx >= patchSize) return;
+    const uint tIdx = patchIdx * POS_SIZE + posIdx;
 
-    const int relativePosYIdx = posIdx / posXSize - (posYSize - 1) / 2;
-    const int relativePosXIdx = posIdx % posXSize - (posXSize - 1) / 2;
+    const int relativePosYIdx = posIdx / KERNEL_SIZE - (KERNEL_SIZE - 1) / 2;
+    const int relativePosXIdx = posIdx % KERNEL_SIZE - (KERNEL_SIZE - 1) / 2;
 
     const uint patchChanBatchIdx = patchIdx / patchYXSizeProd;
     const uint patchYXIdx = patchIdx % patchYXSizeProd;
