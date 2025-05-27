@@ -1,26 +1,26 @@
 DONE:
 
 Activations:
-    ✅ ReLU
-    ✅ Swish / SiLU
-    ✅ GELU
-    ✅ Sigmoid
+    ReLU
+    Swish / SiLU
+    GELU
+    Sigmoid
 
 Elementwise Operations:
-    ✅ Add / Multiply / Subtract / Divide
-    ✅ Matrix-to-Matrix Elementwise (Residual connections, scaling, etc.)
+    Add / Multiply / Subtract / Divide
+    Matrix-to-Matrix Elementwise (Residual connections, scaling, etc.)
 
 Tensor Manipulation:
-    ✅ Transposes, Reordering dims
-    ✅ Flatten / Reshape / View (unpatching / repatching)
+    Transposes, Reordering dims
+    Flatten / Reshape / View (unpatching / repatching)
 
 
-✅ [JUST UP DOWN OPERATION] 
+[JUST UP DOWN OPERATION] 
 4. Global Average Pooling (GAP) ? 
     up and down
 
 
-[LRNABLE] 2. BatchNorm2D
+2. BatchNorm2D
     Normalize across batch for each channel.
     Needs:
         Running mean / var.
@@ -32,7 +32,7 @@ value initialization (random?)
 
 
 
-✅ [LRNABLE] 5. Linear (Fully Connected Layer) 
+[LRNABLE] 5. Linear (Fully Connected Layer) 
     Used in:
         SE blocks (squeeze → excitation).
         Final classification head.
@@ -40,7 +40,7 @@ value initialization (random?)
     // Assembled
 
 
-✅ 7. Softmax
+7. Softmax
     Final classification layer over logits.
     You’ll want numerically stable version.
 
@@ -54,11 +54,4 @@ Depthwise Conv - to calc kernel grad:
 (c, 1, h_ker * w_ker) = (c, 1, batch * h_out * w_out) @ (c, batch * h_out * w_out, h_ker * w_ker)
 
 
-
-
 ---
-
-
-
-TODO:
-OPTIMIZERS ...
