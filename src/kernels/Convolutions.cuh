@@ -1,3 +1,7 @@
+#pragma once
+#include "../utils/Helpers.cuh"
+
+
 
 template <uint KERNEL_SIZE>
 __global__ void im2colInvertKernel(
@@ -190,104 +194,133 @@ __global__ void im2colConvDepthwiseBackward(
 
 
 
+/**
+ * @brief Computes the gradient tensor dLoss/dI = dLoss/dO ∗ 180° rotated filter.
+ *
+ * @tparam BLOCK_X_SIZE Number of threads in the x-dimension of a block.
+ * @tparam BLOCK_Y_SIZE Number of threads in the y-dimension of a block.
+ * @tparam FILTER_SIZE Size of the square convolution filter. Must be an odd number.
+ * @tparam STRIDE Stride of the original convolution operation.
+ *
+ * @param outTensor Output tensor dLoss/dI in the format [C, B, H_in, W_in].
+ * @param inTensor Non-expanded input tensor dLoss/dO in the format [C, B, H_out, W_out].
+ * @param inFilters Convolution filters in the format [C, FILTER_SIZE, FILTER_SIZE].
+ * @param BSize Number of batches.
+ * @param outHSize Height of the output tensor.
+ * @param outWSize Width of the output tensor.
+ * @param outHBlocks Number of block rows in the output height dimension.
+ * @param inHSize Height of the input tensor.
+ * @param inWSize Width of the input tensor.
+ *
+ * @details
+ * The grid for this kernel is launched with a 2D configuration:
+ * - Grid x-dimension: ceil(outWSize / BLOCK_X_SIZE) blocks.
+ * - Grid y-dimension: CSize * BSize * outHBlocks, where outHBlocks = ceil(outHSize / BLOCK_Y_SIZE).
+ */
 template <
-    uint BLOCK_X_SIZE,
-    uint BLOCK_Y_SIZE,
-    uint KERNEL_SIZE,
-    uint STRIDE
+    int BLOCK_X_SIZE,
+    int BLOCK_Y_SIZE,
+    int FILTER_SIZE,
+    int STRIDE
 > __global__
 void tiledDepthwiseConvBackward(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,
-        const float* __restrict__ inKernels,
-        const uint dimZSize,
-        const uint outDimWZYSizeProd,
-        const uint outDimYSize,
-        const uint outDimXSize,
-        const uint inDimYSize,
-        const uint inDimXSize) {
-    static_assert(KERNEL_SIZE % 2);
+        const float* __restrict__ inFilters,
+        const int BSize,
+        const int outHSize,
+        const int outWSize,
+        const int outHBlocks,
+        const int inHSize,
+        const int inWSize) {
+    static_assert(FILTER_SIZE % 2);
     // Calculate template inferred constants
-    constexpr threadsInBlock = BLOCK_Y_SIZE * BLOCK_X_SIZE;
-    // Calculate the maximal dimension y and x tile size 
-    constexpr uint expTileDimYSize = BLOCK_Y_SIZE + KERNEL_SIZE - 1;
-    constexpr uint tileDimYSize = (expTileDimYSize + STRIDE - 1) / STRIDE;
-    constexpr uint expTileDimXSize = BLOCK_X_SIZE + KERNEL_SIZE - 1;
-    constexpr uint tileDimXSize = (expTileDimXSize + STRIDE - 1) / STRIDE;
-    constexpr uint tileFullSize = tileDimYSize * tileDimXSize;
-    // Calculate kernel size and kernel padding
-    constexpr uint kernelFullSize = KERNEL_SIZE * KERNEL_SIZE;
-    constexpr int kernelPaddSize = (KERNEL_SIZE / 2);
-    // Define shared memory for kernel an tile
-    __shared__ float shTile[tileFullSize];
-    __shared__ float shKernel[kernelFullSize];
-    // Calculate dimension x index and flat w,z,y index
-    const uint outDimXBlockFirstIdx = blockIdx.x * blockDim.x;
-    const uint outDimXIdx = outDimXBlockFirstIdx + threadIdx.x;
-    const uint outDimWZYBlockFirstIdx = blockIdx.y * blockDim.y;
-    const uint outDimWZYIdx = outDimWZYBlockFirstIdx + threadIdx.y;
-    // Check bounds for the calculated indexes
-    if (outDimXIdx >= outDimXSize || outDimWZYIdx >= outDimWZYSizeProd) return;
-    // Calculate index within the block and flat output index
-    const uint tInBlockIdx = threadIdx.y * BLOCK_X_SIZE + threadIdx.x;
-    const uint tIdx = outDimWZYIdx * outDimXSize + outDimXIdx;
-    // Calculate index index for the convoluted channel
-    const uint dimWIdx = tIdx / (dimZSize * outDimYSize * outDimXSize);
-    // Load convolution kernel to the shared memory
+    constexpr int THREADS_IN_BLOCK = BLOCK_Y_SIZE * BLOCK_X_SIZE;
+    // Calculate filter size and filter padding
+    constexpr int FILTER_FULL_SIZE = FILTER_SIZE * FILTER_SIZE;
+    constexpr int FILTER_PADD_SIZE = FILTER_SIZE / 2;
+    // Calculate the maximal tile sizes needed
+    constexpr int EXPANDED_TILE_Y_SIZE = BLOCK_Y_SIZE + FILTER_SIZE - 1;
+    constexpr int TILE_Y_SIZE = ceilDiv(EXPANDED_TILE_Y_SIZE, STRIDE);
+    constexpr int EXPANDED_TILE_X_SIZE = BLOCK_X_SIZE + FILTER_SIZE - 1;
+    constexpr int TILE_X_SIZE = ceilDiv(EXPANDED_TILE_X_SIZE, STRIDE);
+    constexpr int TILE_FULL_SIZE = TILE_Y_SIZE * TILE_X_SIZE;
+    // Define shared memory for filter an tile
+    __shared__ float shFilter[FILTER_FULL_SIZE];
+    __shared__ float shTile[TILE_FULL_SIZE];
+    // Calculate W and flat C * B * H out index
+    const int outWIdx = blockIdx.x * BLOCK_X_SIZE + threadIdx.x;
+    const int outCBHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
+    // Calculate flat within block index
+    const int tInBlockIdx = threadIdx.y * BLOCK_X_SIZE + threadIdx.x;
+    // Calculate helper divisor constants
+    const int outHBlockSize = outHBlocks * BLOCK_Y_SIZE;
+    const int outBHBlockSize = BSize * outHBlockSize;
+    // Deconstruct the flat index into B, C and H out indexes
+    const int CIdx = outCBHIdx / outBHBlockSize;
+    const int outLeftoverIdx = outCBHIdx % outBHBlockSize;
+    const int BIdx = outLeftoverIdx / outHBlockSize;
+    const int outHIdx = outLeftoverIdx % outHBlockSize;
+    // Load convolution filter to the shared memory
     #pragma unroll
-    for (uint loadIdx = tInBlockIdx; loadIdx < kernelFullSize; loadIdx += threadsInBlock) {
-        shKernel[loadIdx] = inKernels[dimWIdx * kernelFullSize + loadIdx];
+    for (int loadIdx = tInBlockIdx; loadIdx < FILTER_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
+        shFilter[loadIdx] = inFilters[CIdx * FILTER_FULL_SIZE + loadIdx];
     }
-    __syncthreads();
-    // Calculate dimension x and y start input index and tile size for the block
-    const int inDimXStartIdx = (outDimXBlockFirstIdx - kernelPaddSize + STRIDE - 1) / STRIDE;
-    const uint outDimYBlockFirstIdx = outDimWZYBlockFirstIdx % outDimYSize;
-    const int inDimYStartIdx = (outDimYBlockFirstIdx - kernelPaddSize + STRIDE - 1) / STRIDE;
-    // Calculate dimension w,z index part for input indexes
-    const uint inDimWZIdxPart = (outDimWZYBlockFirstIdx / outDimYSize) * inDimYSize * inDimXSize;
-    // Load the max needed size padded tiles into shared memory
+    __syncthreads();    
+    // Calculate in padding offset W and H first needed value indexes for the block
+    const int inWFirstNeededIdx = ceilDiv(blockIdx.x * BLOCK_X_SIZE - FILTER_PADD_SIZE, STRIDE);
+    const int inHFirstNeededIdx = ceilDiv(blockIdx.y % outHBlocks * BLOCK_Y_SIZE - FILTER_PADD_SIZE, STRIDE);
+    // Calculate in C, B flat index part for input indexes
+    const int CBIdx = CIdx * BSize + BIdx;
+    const int inCBIdxPart = CBIdx * inHSize * inWSize;
+    // Load the padded tiles into shared memory
     #pragma unroll
-    for (uint loadIdx = tInBlockIdx; loadIdx < tileFullSize; loadIdx += threadsInBlock) {
-        // Calculate dimension y and x input indexes
-        const int inLoadDimYIdx = inDimYStartIdx + loadIdx / tileDimXSize;
-        const int inLoadDimXIdx = inDimXStartIdx + loadIdx % tileDimXSize;
+    for (int loadIdx = tInBlockIdx; loadIdx < TILE_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
+        // Calculate in H and Y load indexes
+        const int inLoadHIdx = inHFirstNeededIdx + loadIdx / TILE_X_SIZE;
+        const int inLoadWIdx = inWFirstNeededIdx + loadIdx % TILE_X_SIZE;
         // Use zero padding if out of bounds
-        if (inLoadDimYIdx < 0 || inLoadDimYIdx >= inDimYSize
-                || inLoadDimXIdx < 0 || inLoadDimXIdx >= inDimXSize) {
+        if (inLoadHIdx < 0 || inLoadHIdx >= inHSize
+                || inLoadWIdx < 0 || inLoadWIdx >= inWSize) {
             shTile[loadIdx] = 0.0f;
             continue;
         }
         // Calculate flat input index and load convoluted region cell to shared memory
-        const uint inLoadIdx = inDimWZIdxPart + inLoadDimYIdx * inDimXSize + inLoadDimXIdx;
+        const int inLoadIdx = inCBIdxPart + inLoadHIdx * inWSize + inLoadWIdx;
         shTile[loadIdx] = inTensor[inLoadIdx];
     }
     __syncthreads();
-    // Calculate top left convolution indexes for the expanded input to the size of output
-    const int expRegionDimYStartIdx = outDimWZYIdx % outDimYSize - kernelPaddSize;
-    const int expRegionDimXStartIdx = outDimXIdx - kernelPaddSize;
-    // Compute inverted convolution on the kernel and expanded input region
+    // Check bounds for the calculated indexes after loading data
+    if (outHIdx >= outHSize || outWIdx >= outWSize) return;
+    // Calculate top left convolution indexes for the expanded input
+    const int expandedHIdx = outHIdx - FILTER_PADD_SIZE;
+    const int expandedWIdx = outWIdx - FILTER_PADD_SIZE;
+    // Compute inverted convolution on the filter and expanded input region
     float convolutionSum = 0.0f;
     #pragma unroll
-    for (uint kernelYIdx = 0; kernelYIdx < KERNEL_SIZE; ++kernelYIdx) {
+    for (int filterYIdx = 0; filterYIdx < FILTER_SIZE; ++filterYIdx) {
         #pragma unroll
-        for (uint kernelXIdx = 0; kernelXIdx < KERNEL_SIZE; ++kernelXIdx) {
-            // Calculate the current expanded input index offset by the kernel
-            const int expCurrDimYIdx = expRegionDimYStartIdx + kernelYIdx;
-            const int expCurrDimXIdx = expRegionDimXStartIdx + kernelXIdx;
+        for (int filterXIdx = 0; filterXIdx < FILTER_SIZE; ++filterXIdx) {
+            // Calculate the current expanded input index offset by the filter
+            const int expCurrHIdx = expandedHIdx + filterYIdx;
+            const int expCurrWIdx = expandedWIdx + filterXIdx;
             // Check whether the expanded region is occupied with value or not
-            if (expCurrDimYIdx % STRIDE || expCurrDimXIdx % STRIDE) continue;      
+            if (expCurrHIdx % STRIDE || expCurrWIdx % STRIDE) continue;
             // Calculate where in the shared memory tile is the needed value
-            const uint tileDimYIdx = expCurrDimYIdx / STRIDE - inDimYStartIdx;
-            const uint tileDimXIdx = expCurrDimXIdx / STRIDE - inDimXStartIdx;
-            const float regionValue = shTile[tileDimYIdx * tileDimXSize + tileDimXIdx];
-            // Load the corresponding inverted kernel value
-            const uint invrtKernelYIdx = (KERNEL_SIZE - kernelYIdx - 1);
-            const uint invrtKernelXIdx = (KERNEL_SIZE - kernelXIdx - 1);
-            const float kernelValue = shKernel[invrtKernelYIdx * KERNEL_SIZE + invrtKernelXIdx];
-            // Multiply the kernel value with the corresponding region cell
-            convolutionSum += regionValue * kernelValue;
+            const int tileYIdx = expCurrHIdx / STRIDE - inHFirstNeededIdx;
+            const int tileXIdx = expCurrWIdx / STRIDE - inWFirstNeededIdx;
+            const float regionValue = shTile[tileYIdx * TILE_X_SIZE + tileXIdx];
+            // Load the corresponding inverted filter value
+            const int invrtFilterYIdx = (FILTER_SIZE - filterYIdx - 1);
+            const int invrtFilterXIdx = (FILTER_SIZE - filterXIdx - 1);
+            const float filterValue = shFilter[invrtFilterYIdx * FILTER_SIZE + invrtFilterXIdx];
+            // Multiply the filter value with the corresponding region cell
+            convolutionSum += regionValue * filterValue;
         }
     }
+    // Calculate flat output index and save result
+    const int outCBIdxPart = CBIdx * outHSize * outWSize;
+    const int tIdx = outCBIdxPart + outHIdx * outWSize + outWIdx;
     outTensor[tIdx] = convolutionSum;
 }
 
@@ -334,15 +367,18 @@ void tiledDepthwiseConvForward(
         const int inWSize) {
     static_assert(FILTER_SIZE % 2);
     // Calculate template inferred constants
-    constexpr int THREADS_IN_BLOCK = BLOCK_Y_SIZE * BLOCK_X_SIZE;        
+    constexpr int THREADS_IN_BLOCK = BLOCK_Y_SIZE * BLOCK_X_SIZE;
+    // Calculate filter size and filter padding
     constexpr int FILTER_FULL_SIZE = FILTER_SIZE * FILTER_SIZE;
     constexpr int FILTER_PADD_SIZE = FILTER_SIZE / 2;
+    // Calculate the maximal tile sizes needed
     constexpr int TILE_SIZE_FIX = 2 * FILTER_PADD_SIZE - (STRIDE - 1);
-    constexpr int TILE_Y_MAX_SIZE = BLOCK_Y_SIZE * STRIDE + TILE_SIZE_FIX;
-    constexpr int TILE_X_MAX_SIZE = BLOCK_X_SIZE * STRIDE + TILE_SIZE_FIX;
+    constexpr int TILE_Y_SIZE = BLOCK_Y_SIZE * STRIDE + TILE_SIZE_FIX;
+    constexpr int TILE_X_SIZE = BLOCK_X_SIZE * STRIDE + TILE_SIZE_FIX;
+    constexpr int TILE_FULL_SIZE = TILE_Y_SIZE * TILE_X_SIZE;
     // Define shared memory for filter an tile
-    __shared__ float shKernel[FILTER_FULL_SIZE];
-    __shared__ float shTile[TILE_Y_MAX_SIZE * TILE_X_MAX_SIZE];
+    __shared__ float shFilter[FILTER_FULL_SIZE];
+    __shared__ float shTile[TILE_FULL_SIZE];
     // Calculate W and flat C * B * H out index
     const int outWIdx = blockIdx.x * BLOCK_X_SIZE + threadIdx.x;
     const int outCBHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
@@ -356,34 +392,24 @@ void tiledDepthwiseConvForward(
     const int outLeftoverIdx = outCBHIdx % outBHBlockSize;
     const int BIdx = outLeftoverIdx / outHBlockSize;
     const int outHIdx = outLeftoverIdx % outHBlockSize;
-    // Load convolution kernel to the shared memory
+    // Load convolution filter to the shared memory
     #pragma unroll
     for (int loadIdx = tInBlockIdx; loadIdx < FILTER_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
-        shKernel[loadIdx] = inFilters[CIdx * FILTER_FULL_SIZE + loadIdx];
+        shFilter[loadIdx] = inFilters[CIdx * FILTER_FULL_SIZE + loadIdx];
     }
     __syncthreads();
-    // Calculate out W and H start indexes for the block 
-    const int outWStartIdx = blockIdx.x * BLOCK_X_SIZE;
-    const int outblockInCBIdx = blockIdx.y % outHBlocks;
-    const int outHStartIdx = outblockInCBIdx * BLOCK_Y_SIZE;
-    // Calculate tile X and Y subtract sizes
-    const int tileXSub = max(0, outWStartIdx + BLOCK_X_SIZE - outWSize) * STRIDE;
-    const int tileYSub = max(0, outHStartIdx + BLOCK_Y_SIZE - outHSize) * STRIDE;
-    // Calculate actual tile X and Y sizes
-    const int tileXSize = TILE_X_MAX_SIZE - tileXSub;
-    const int tileYSize = TILE_Y_MAX_SIZE - tileYSub;
-    const int tileFullSize = tileYSize * tileXSize;
     // Calculate in padding offset W and H start indexes for the block
     const int inWStartOffsetIdx = blockIdx.x * BLOCK_X_SIZE * STRIDE - FILTER_PADD_SIZE;
-    const int inHStartOffsetIdx = outblockInCBIdx * BLOCK_Y_SIZE * STRIDE - FILTER_PADD_SIZE;
+    const int inHStartOffsetIdx = blockIdx.y % outHBlocks * BLOCK_Y_SIZE * STRIDE - FILTER_PADD_SIZE;
     // Calculate in C, B flat index part for input indexes
     const int CBIdx = CIdx * BSize + BIdx;
     const int inCBIdxPart = CBIdx * inHSize * inWSize;
     // Load the padded tiles into shared memory
-    for (int loadIdx = tInBlockIdx; loadIdx < tileFullSize; loadIdx += THREADS_IN_BLOCK) {
-        // Calculate in H and Y input indexes
-        const int inLoadHIdx = inHStartOffsetIdx + loadIdx / tileXSize;
-        const int inLoadWIdx = inWStartOffsetIdx + loadIdx % tileXSize;
+    #pragma unroll
+    for (int loadIdx = tInBlockIdx; loadIdx < TILE_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
+        // Calculate in H and Y load indexes
+        const int inLoadHIdx = inHStartOffsetIdx + loadIdx / TILE_X_SIZE;
+        const int inLoadWIdx = inWStartOffsetIdx + loadIdx % TILE_X_SIZE;
         // Use zero padding if out of bounds
         if (inLoadHIdx < 0 || inLoadHIdx >= inHSize
                 || inLoadWIdx < 0 || inLoadWIdx >= inWSize) {
@@ -400,19 +426,19 @@ void tiledDepthwiseConvForward(
     // Calculate top left Y and X convolution indexes within the block
     const int tileYIdx = threadIdx.y * STRIDE;
     const int tileXIdx = threadIdx.x * STRIDE;
-    // Compute convolution on the kernel and region
+    // Compute convolution on the filter and region
     float convolutionSum = 0.0f;
     #pragma unroll
-    for (int kernelYIdx = 0; kernelYIdx < KERNEL_SIZE; ++kernelYIdx) {
+    for (int filterYIdx = 0; filterYIdx < FILTER_SIZE; ++filterYIdx) {
         #pragma unroll
-        for (int kernelXIdx = 0; kernelXIdx < KERNEL_SIZE; ++kernelXIdx) {
-            // Load the corresponding kernel value
-            const float kernelValue = shKernel[kernelYIdx * KERNEL_SIZE + kernelXIdx];
+        for (int filterXIdx = 0; filterXIdx < FILTER_SIZE; ++filterXIdx) {
+            // Load the corresponding filter value
+            const float filterValue = shFilter[filterYIdx * FILTER_SIZE + filterXIdx];
             // Calculate index of the corresponding cell
-            const int convIdxYPart = (tileYIdx + kernelYIdx) * tileXSize;
-            const int convIdxXPart = tileXIdx + kernelXIdx;
-            // Multiply the kernel value with the corresponding region cell
-            convolutionSum += shTile[convIdxYPart + convIdxXPart] * kernelValue;
+            const int convIdxYPart = (tileYIdx + filterYIdx) * TILE_X_SIZE;
+            const int convIdxXPart = tileXIdx + filterXIdx;
+            // Multiply the filter value with the corresponding region cell
+            convolutionSum += shTile[convIdxYPart + convIdxXPart] * filterValue;
         }
     }
     // Calculate flat output index and save result
