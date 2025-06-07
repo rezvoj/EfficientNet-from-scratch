@@ -12,10 +12,10 @@
  * @tparam FILTER_SIZE Size of the square convolution filter. Must be an odd number.
  * @tparam STRIDE Stride of the convolution operation.
  *
- * @param outTensor Output tensor in the format [C, B, H_out, W_out].
- * @param inTensor Input tensor in the format [C, B, H_in, W_in].
+ * @param outTensor Output tensor in the format [B, C, H_out, W_out].
+ * @param inTensor Input tensor in the format [B, C, H_in, W_in].
  * @param inFilters Convolution filters in the format [C, FILTER_SIZE, FILTER_SIZE].
- * @param BSize Number of batches.
+ * @param CSize Number of channels.
  * @param outHSize Height of the output tensor.
  * @param outWSize Width of the output tensor.
  * @param outHBlocks Number of block rows in the output height dimension.
@@ -25,7 +25,7 @@
  * @details
  * The grid for this kernel is launched with a 2D configuration:
  * - Grid x-dimension: ceil(outWSize / BLOCK_X_SIZE) blocks.
- * - Grid y-dimension: CSize * BSize * outHBlocks, where outHBlocks = ceil(outHSize / BLOCK_Y_SIZE).
+ * - Grid y-dimension: BSize * CSize * outHBlocks, where outHBlocks = ceil(outHSize / BLOCK_Y_SIZE).
  */
 template <
     int BLOCK_X_SIZE,
@@ -37,7 +37,7 @@ void depthwiseConvForward(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,
         const float* __restrict__ inFilters,
-        const int BSize,
+        const int CSize,
         const int outHSize,
         const int outWSize,
         const int outHBlocks,
@@ -57,21 +57,20 @@ void depthwiseConvForward(
     // Define shared memory for filter an tile
     __shared__ float shFilter[FILTER_FULL_SIZE];
     __shared__ float shTile[TILE_FULL_SIZE];
-    // Calculate W and flat C * B * H out index
+    // Calculate W and flat B * C * H out index
     const int outWIdx = blockIdx.x * BLOCK_X_SIZE + threadIdx.x;
-    const int outCBHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
+    const int outBCHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
     // Calculate flat within block index
     const int tInBlockIdx = threadIdx.y * BLOCK_X_SIZE + threadIdx.x;
     // Calculate helper divisor constants
     const int outHBlockSize = outHBlocks * BLOCK_Y_SIZE;
-    const int outBHBlockSize = BSize * outHBlockSize;
+    const int outCHBlockSize = CSize * outHBlockSize;
     // Deconstruct the flat index into B, C and H out indexes
-    const int CIdx = outCBHIdx / outBHBlockSize;
-    const int outLeftoverIdx = outCBHIdx % outBHBlockSize;
-    const int BIdx = outLeftoverIdx / outHBlockSize;
+    const int BIdx = outBCHIdx / outCHBlockSize;
+    const int outLeftoverIdx = outBCHIdx % outCHBlockSize;
+    const int CIdx = outLeftoverIdx / outHBlockSize;
     const int outHIdx = outLeftoverIdx % outHBlockSize;
     // Load convolution filter to the shared memory
-    #pragma unroll
     for (int loadIdx = tInBlockIdx; loadIdx < FILTER_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
         shFilter[loadIdx] = inFilters[CIdx * FILTER_FULL_SIZE + loadIdx];
     }
@@ -79,11 +78,10 @@ void depthwiseConvForward(
     // Calculate in padding offset W and H start indexes for the block
     const int inWStartOffsetIdx = blockIdx.x * BLOCK_X_SIZE * STRIDE - FILTER_PADD_SIZE;
     const int inHStartOffsetIdx = blockIdx.y % outHBlocks * BLOCK_Y_SIZE * STRIDE - FILTER_PADD_SIZE;
-    // Calculate in C * B flat index part for input indexes
-    const int CBIdx = CIdx * BSize + BIdx;
-    const int inCBIdxPart = CBIdx * inHSize * inWSize;
+    // Calculate in B * C flat index part for input indexes
+    const int BCIdx = BIdx * CSize + CIdx;
+    const int inBCIdxPart = BCIdx * inHSize * inWSize;
     // Load the padded tiles into shared memory
-    #pragma unroll
     for (int loadIdx = tInBlockIdx; loadIdx < TILE_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
         // Calculate in H and Y load indexes
         const int inLoadHIdx = inHStartOffsetIdx + loadIdx / TILE_X_SIZE;
@@ -95,7 +93,7 @@ void depthwiseConvForward(
             continue;
         }
         // Calculate flat input index and load convoluted region cell to shared memory
-        const int inLoadIdx = inCBIdxPart + inLoadHIdx * inWSize + inLoadWIdx;
+        const int inLoadIdx = inBCIdxPart + inLoadHIdx * inWSize + inLoadWIdx;
         shTile[loadIdx] = inTensor[inLoadIdx];
     }
     __syncthreads();
@@ -106,9 +104,7 @@ void depthwiseConvForward(
     const int tileXIdx = threadIdx.x * STRIDE;
     // Compute convolution on the filter and region
     float convolutionSum = 0.0f;
-    #pragma unroll
     for (int filterYIdx = 0; filterYIdx < FILTER_SIZE; ++filterYIdx) {
-        #pragma unroll
         for (int filterXIdx = 0; filterXIdx < FILTER_SIZE; ++filterXIdx) {
             // Load the corresponding filter value
             const float filterValue = shFilter[filterYIdx * FILTER_SIZE + filterXIdx];
@@ -120,8 +116,8 @@ void depthwiseConvForward(
         }
     }
     // Calculate flat output index and save result
-    const int outCBIdxPart = CBIdx * outHSize * outWSize;
-    const int tIdx = outCBIdxPart + outHIdx * outWSize + outWIdx;
+    const int outBCIdxPart = BCIdx * outHSize * outWSize;
+    const int tIdx = outBCIdxPart + outHIdx * outWSize + outWIdx;
     outTensor[tIdx] = convolutionSum;
 }
 
@@ -135,10 +131,10 @@ void depthwiseConvForward(
  * @tparam FILTER_SIZE Size of the original convolution filter.
  * @tparam STRIDE Stride of the original convolution operation.
  *
- * @param outTensor Output tensor dLoss/dI in the format [C, B, H_in, W_in].
- * @param inTensor Non-expanded input tensor dLoss/dO in the format [C, B, H_out, W_out].
+ * @param outTensor Output tensor dLoss/dI in the format [B, C, H_in, W_in].
+ * @param inTensor Non-expanded input tensor dLoss/dO in the format [B, C, H_out, W_out].
  * @param inFilters Convolution filters in the format [C, FILTER_SIZE, FILTER_SIZE].
- * @param BSize Number of batches.
+ * @param CSize Number of channels.
  * @param outHSize Height of the output tensor.
  * @param outWSize Width of the output tensor.
  * @param outHBlocks Number of block rows in the output height dimension.
@@ -148,7 +144,7 @@ void depthwiseConvForward(
  * @details
  * The grid for this kernel is launched with a 2D configuration:
  * - Grid x-dimension: ceil(outWSize / BLOCK_X_SIZE) blocks.
- * - Grid y-dimension: CSize * BSize * outHBlocks, where outHBlocks = ceil(outHSize / BLOCK_Y_SIZE).
+ * - Grid y-dimension: BSize * CSize * outHBlocks, where outHBlocks = ceil(outHSize / BLOCK_Y_SIZE).
  */
 template <
     int BLOCK_X_SIZE,
@@ -160,7 +156,7 @@ void depthwiseConvBackward(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,
         const float* __restrict__ inFilters,
-        const int BSize,
+        const int CSize,
         const int outHSize,
         const int outWSize,
         const int outHBlocks,
@@ -181,33 +177,31 @@ void depthwiseConvBackward(
     // Define shared memory for filter an tile
     __shared__ float shFilter[FILTER_FULL_SIZE];
     __shared__ float shTile[TILE_FULL_SIZE];
-    // Calculate W and flat C * B * H out index
+    // Calculate W and flat B * C * H out index
     const int outWIdx = blockIdx.x * BLOCK_X_SIZE + threadIdx.x;
-    const int outCBHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
+    const int outBCHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
     // Calculate flat within block index
     const int tInBlockIdx = threadIdx.y * BLOCK_X_SIZE + threadIdx.x;
     // Calculate helper divisor constants
     const int outHBlockSize = outHBlocks * BLOCK_Y_SIZE;
-    const int outBHBlockSize = BSize * outHBlockSize;
+    const int outCHBlockSize = CSize * outHBlockSize;
     // Deconstruct the flat index into B, C and H out indexes
-    const int CIdx = outCBHIdx / outBHBlockSize;
-    const int outLeftoverIdx = outCBHIdx % outBHBlockSize;
-    const int BIdx = outLeftoverIdx / outHBlockSize;
+    const int BIdx = outBCHIdx / outCHBlockSize;
+    const int outLeftoverIdx = outBCHIdx % outCHBlockSize;
+    const int CIdx = outLeftoverIdx / outHBlockSize;
     const int outHIdx = outLeftoverIdx % outHBlockSize;
     // Load convolution filter to the shared memory
-    #pragma unroll
     for (int loadIdx = tInBlockIdx; loadIdx < FILTER_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
         shFilter[loadIdx] = inFilters[CIdx * FILTER_FULL_SIZE + loadIdx];
     }
-    __syncthreads();    
+    __syncthreads();
     // Calculate in padding offset W and H first needed value indexes for the block
     const int inWFirstNeededIdx = ceilDiv(static_cast<int>(blockIdx.x) * BLOCK_X_SIZE - FILTER_PADD_SIZE, STRIDE);
     const int inHFirstNeededIdx = ceilDiv(static_cast<int>(blockIdx.y) % outHBlocks * BLOCK_Y_SIZE - FILTER_PADD_SIZE, STRIDE);
-    // Calculate in C * B flat index part for input indexes
-    const int CBIdx = CIdx * BSize + BIdx;
-    const int inCBIdxPart = CBIdx * inHSize * inWSize;
+    // Calculate in B * C flat index part for input indexes
+    const int BCIdx = BIdx * CSize + CIdx;
+    const int inBCIdxPart = BCIdx * inHSize * inWSize;
     // Load the padded tiles into shared memory
-    #pragma unroll
     for (int loadIdx = tInBlockIdx; loadIdx < TILE_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
         // Calculate in H and Y load indexes
         const int inLoadHIdx = inHFirstNeededIdx + loadIdx / TILE_X_SIZE;
@@ -219,7 +213,7 @@ void depthwiseConvBackward(
             continue;
         }
         // Calculate flat input index and load convoluted region cell to shared memory
-        const int inLoadIdx = inCBIdxPart + inLoadHIdx * inWSize + inLoadWIdx;
+        const int inLoadIdx = inBCIdxPart + inLoadHIdx * inWSize + inLoadWIdx;
         shTile[loadIdx] = inTensor[inLoadIdx];
     }
     __syncthreads();
@@ -230,9 +224,7 @@ void depthwiseConvBackward(
     const int expandedWIdx = outWIdx - FILTER_PADD_SIZE;
     // Compute inverted convolution on the filter and expanded input region
     float convolutionSum = 0.0f;
-    #pragma unroll
     for (int filterYIdx = 0; filterYIdx < FILTER_SIZE; ++filterYIdx) {
-        #pragma unroll
         for (int filterXIdx = 0; filterXIdx < FILTER_SIZE; ++filterXIdx) {
             // Calculate the current expanded input index offset by the filter
             const int expCurrHIdx = expandedHIdx + filterYIdx;
@@ -252,20 +244,125 @@ void depthwiseConvBackward(
         }
     }
     // Calculate flat output index and save result
-    const int outCBIdxPart = CBIdx * outHSize * outWSize;
-    const int tIdx = outCBIdxPart + outHIdx * outWSize + outWIdx;
+    const int outBCIdxPart = BCIdx * outHSize * outWSize;
+    const int tIdx = outBCIdxPart + outHIdx * outWSize + outWIdx;
     outTensor[tIdx] = convolutionSum;
 }
 
 
 
+/**
+ * @brief Sums up the values for given warp 
+ * @param threadValue Value of the single thread in the warp
+ * @returns for first thread in the warp the total sum for the warp.
+ */
+__forceinline__ __device__ 
+float warpReduce(float threadValue) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        threadValue += __shfl_down_sync(0xFFFFFFFF, threadValue, offset);
+    }
+    return threadValue; 
+}
+
+
+
+/**
+ * @brief Computes the batch accumulated gradient tensor dLoss/dK.
+ *
+ * @tparam BLOCK_SIZE Number of threads in a single block.
+ * @tparam FILTER_SIZE Size of the original convolution filter.
+ * @tparam STRIDE Stride of the original convolution operation.
+ *
+ * @param outFilterGrads Output filter gradients in the format [C, FILTER_SIZE, FILTER_SIZE].
+ * @param outTensor Output gradient tensor dLoss/dO in the format [B, C, H_out, W_out].
+ * @param inTensor Input tensor dI in the format [B, C, H_in, W_in].
+ * @param BSize Batch size.
+ * @param CSize Number of channels.
+ * @param outHWSize Product of height * width of the output tensor.
+ * @param outWSize Width of the output tensor.
+ * @param inHSize Height of the input tensor.
+ * @param inWSize Width of the input tensor.
+ *
+ * @details
+ * The grid for this kernel is launched with a 1D configuration:
+ * - Grid x-dimension: CSize * H_fil * W_fil blocks.
+ */
 template <
-    int BLOCK_X_SIZE,
-    int BLOCK_Y_SIZE,
+    int BLOCK_SIZE,
     int FILTER_SIZE,
     int STRIDE
 > __global__
-void depthwiseConvBackwardGrad() {}
+void depthwiseConvBackwardGrad(
+        float* __restrict__ outFilterGrads,
+        const float* __restrict__ outTensor,
+        const float* __restrict__ inTensor,
+        const int BSize,
+        const int CSize,
+        const int outHWSize,
+        const int outWSize,
+        const int inHSize,
+        const int inWSize) {
+    static_assert(FILTER_SIZE % 2);
+    constexpr int WARP_SIZE = 32;
+    static_assert(BLOCK_SIZE % WARP_SIZE == 0);
+    // Calculate template inferred constants
+    constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
+    // Calculate filter size and filter padding
+    constexpr int FILTER_FULL_SIZE = FILTER_SIZE * FILTER_SIZE;
+    constexpr int FILTER_PADD_SIZE = FILTER_SIZE / 2;
+    // Define for sharing results between warps
+    __shared__ float shResults[WARPS_PER_BLOCK];
+    // Deconstruct the thread within block index to warp and thread withing warp indexes
+    const int warpInBlockIdx = static_cast<int>(threadIdx.x) / WARP_SIZE;
+    const int tInWarpIdx = static_cast<int>(threadIdx.x) % WARP_SIZE;
+    // Deconstruct the block index to C, H_fil, W_fil indexes
+    const int CIdx = static_cast<int>(blockIdx.x) / FILTER_FULL_SIZE;
+    const int filterHWIdx = static_cast<int>(blockIdx.x) % FILTER_FULL_SIZE;
+    const int filterOffsetHIdx = filterHWIdx / FILTER_SIZE - FILTER_PADD_SIZE;
+    const int filterOffsetWIdx = filterHWIdx % FILTER_SIZE - FILTER_PADD_SIZE;
+    // Sum the contribution values for the given thread
+    float threadValue = 0.0f;
+    for (int BIdx = warpInBlockIdx; BIdx < BSize; BIdx += WARPS_PER_BLOCK) {
+        // Calculate B * C index part for input and output tensors
+        const int BCIdx = BIdx * CSize + CIdx;
+        const int outBCIdxPart = BCIdx * outHWSize;
+        const int inBCIdxPart = BCIdx * inHSize * inWSize;
+        // Iterate the contributions in the current batch
+        for (int outHWIdx = tInWarpIdx; outHWIdx < outHWSize; outHWIdx += WARP_SIZE) {
+            // Calculate contribution input and output tensor indexes
+            const int outHIdx = outHWIdx / outWSize;
+            const int outWIdx = outHWIdx % outWSize;
+            const int inHIdx = outHIdx * STRIDE + filterOffsetHIdx;
+            const int inWIdx = outWIdx * STRIDE + filterOffsetWIdx;
+            // Check if padding or not was used during forward conv for this contribution
+            if (inHIdx < 0 || inHIdx >= inHSize || inWIdx < 0 || inWIdx >= inWSize) continue;
+            // Calculate contribution global input and output tensor indexes
+            const int outIdx = outBCIdxPart + outHIdx * outWSize + outWIdx;
+            const int inIdx = inBCIdxPart + inHIdx * inWSize + inWIdx;
+            // Add the contribution value to the thread's sum
+            const float outValue = outTensor[outIdx];
+            const float inValue = inTensor[inIdx];
+            threadValue += outValue * inValue;
+        }
+    }
+    // Warp reduce within the whole block into shared memory
+    threadValue = warpReduce(threadValue);
+    if (tInWarpIdx == 0) {
+        shResults[warpInBlockIdx] = threadValue;
+    }
+    __syncthreads();
+    // Exit all warps except first
+    if (warpInBlockIdx != 0) return;
+    // Warp reduce the only first warp to get the final sum value
+    threadValue = tInWarpIdx < WARPS_PER_BLOCK ? shResults[tInWarpIdx] : 0;
+    threadValue = warpReduce(threadValue);
+    // Save the final value for the whole block
+    if (threadIdx.x != 0) return;
+    outFilterGrads[blockIdx.x] = threadValue;
+}
+
+
+
 
 
 
@@ -520,7 +617,6 @@ void reshapeTensor(
     const uint outFullIdx = blockIdx.x * blockDim.x + threadIdx.x;
     uint outIdxes[TensorDim];
     uint outCurrIdx = outFullIdx;
-    #pragma unroll
     for (uint dimIdx = 0; dimIdx < TensorDim; ++dimIdx) {
         const uint currentDimSizeSum = outDimSizeSums[dimIdx];
         outIdxes[dimIdx] = outCurrIdx / currentDimSizeSum;
@@ -529,7 +625,6 @@ void reshapeTensor(
     float value = 0.0f;
     if (outIdxes[TensorDim - 1] < outRowSize) {
         uint inFullIdx = 0;
-        #pragma unroll
         for (uint dimIdx = 0; dimIdx < TensorDim; ++dimIdx) {
             const uint currDimIdx = outIdxes[outOrder[dimIdx]];
             inFullIdx += currDimIdx * inDimSizeSums[currDimIdx];
