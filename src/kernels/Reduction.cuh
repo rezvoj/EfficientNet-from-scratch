@@ -1,6 +1,5 @@
 
-__global__
-void computeReductionOffsets(
+static __global__ void computeReductionOffsets(
         uint* __restrict__ outStartOffsets,
         uint* __restrict__ outEndOffsets,
         const uint rowSize,
@@ -14,7 +13,7 @@ void computeReductionOffsets(
 
 
 // maybe fuse with transpose
-__global__
+static __global__
 void broadcastValue2DimsUp(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,

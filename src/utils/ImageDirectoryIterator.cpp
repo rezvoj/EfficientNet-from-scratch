@@ -5,18 +5,10 @@
 #include <algorithm>    // For std::min and std::shuffle
 #include <iostream>
 #include <chrono>       // For std::chrono
-
+#include "CudaUtils.hpp"
 // Include the CUDA runtime API for cudaMemcpy
 #include <cuda_runtime.h>
 
-// Helper to check for CUDA errors
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
-    if (code != cudaSuccess) {
-        fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-        if (abort) exit(code);
-    }
-}
-#define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 
 // --- ImageDirectoryIterator Class Implementation ---
 

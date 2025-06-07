@@ -33,7 +33,7 @@ endif()
 # This is the path we decided on. If you installed it elsewhere, change this line.
 set(OpenCV_DIR "C:/dev/opencv_install/staticlib")
 find_package(OpenCV REQUIRED)
-
+find_package(CUDAToolkit REQUIRED)
 # This message is just a sanity check to confirm it found OpenCV.
 message(STATUS "Found OpenCV version ${OpenCV_VERSION} in ${OpenCV_DIR}")
 
@@ -51,8 +51,7 @@ add_library(efficientnet_lib ${EFFICIENTNET_SOURCES})
 # Link your library against OpenCV.
 # FIX: Use PUBLIC so that any target linking to efficientnet_lib (like main_app)
 # also inherits the include directories from OpenCV.
-target_link_libraries(efficientnet_lib PUBLIC ${OpenCV_LIBS})
-
+target_link_libraries(efficientnet_lib PUBLIC ${OpenCV_LIBS} CUDA::cublas)
 # We still need a main executable to run the project.
 add_executable(main_app src/main.cpp)
 

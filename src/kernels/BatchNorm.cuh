@@ -1,5 +1,5 @@
 
-__global__
+static __global__
 void computeMeanDiffSquared(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,
@@ -14,7 +14,7 @@ void computeMeanDiffSquared(
 }
 
 
-__global__
+static __global__
 void computeMeansVarsUpdateRunning(
         float* __restrict__ outRunningMeans,
         float* __restrict__ outRunningVars,    
@@ -34,7 +34,7 @@ void computeMeansVarsUpdateRunning(
 }
 
 
-__global__
+static __global__
 void normalizeTensorInplace(
         float* __restrict__ tensor,
         const float* __restrict__ inMeansVec,
@@ -51,7 +51,7 @@ void normalizeTensorInplace(
 }
 
 
-__global__
+static __global__
 void scaleShiftTensor(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,
@@ -68,7 +68,7 @@ void scaleShiftTensor(
 }
 
 
-__global__
+static __global__
 void normalizeScaleShiftTensorInplace(
         float* __restrict__ tensor,
         const float* __restrict__ inMeansVec,
@@ -90,7 +90,7 @@ void normalizeScaleShiftTensorInplace(
 }
 
 
-__global__
+static __global__
 void batchNormPrevGradInplace(
         float* __restrict__ gradTensor,
         const float* __restrict__ inScaleVec,

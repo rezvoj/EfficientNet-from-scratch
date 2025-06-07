@@ -4,7 +4,7 @@
 
 
 template <bool UseNormal>
-__global__
+static __global__
 void initRandomValues(
         float* __restrict__ outValues,
         const uint seed,
@@ -22,7 +22,7 @@ void initRandomValues(
 }
 
 
-__global__
+static __global__
 void initDropoutMask(
         float* __restrict__ outMask,
         const uint seed,
@@ -38,7 +38,7 @@ void initDropoutMask(
 }
 
 
-__global__
+static __global__
 void clearValue(
         float* __restrict__ outValues,
         const float value,

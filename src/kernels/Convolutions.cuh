@@ -23,7 +23,7 @@
  * (C_out, B * H_out * W_out) = (C_out, C_in * H_fil * W_fil) @ (C_in * H_fil * W_fil, B * H_out * W_out)
  */
 template <int FILTER_SIZE, int STRIDE>
-__global__ void im2colConv(
+static __global__ void im2colConv(
         float* __restrict__ tensorOut,
         const float* __restrict__ tensorIn,
         const int CSize,
@@ -91,7 +91,7 @@ __global__ void im2colConv(
  * - Grid y-dimension: covering B * H_out * W_out elements.
  */
 template <int FILTER_SIZE, int STRIDE>
-__global__ void im2colConvBackward(
+static __global__ void im2colConvBackward(
         float* __restrict__ tensorOut,
         const float* __restrict__ tensorIn,
         const int CSize,
@@ -156,7 +156,7 @@ __global__ void im2colConvBackward(
  * - Grid x-dimension: covering C_in * C_out * FILTER_SIZE * FILTER_SIZE elements.
  */
 template <uint FILTER_SIZE>
-__global__ void im2colInvertFilters(
+static __global__ void im2colInvertFilters(
         float* __restrict__ tensorOut,
         const float* __restrict__ tensorIn,
         const uint inCSize,
@@ -212,7 +212,7 @@ __global__ void im2colInvertFilters(
  * - Grid y-dimension: covering C_out * FILTER_SIZE * FILTER_SIZE elements.
  */
 template <int FILTER_SIZE, int STRIDE>
-__global__ void im2colConvBackwardInverted(
+static __global__ void im2colConvBackwardInverted(
         float* __restrict__ tensorOut,
         const float* __restrict__ tensorIn,
         const int CSize,
@@ -289,7 +289,7 @@ __global__ void im2colConvBackwardInverted(
  * - Grid y-dimension: covering C * B * H_out * W_out elements.
  */
 template <int FILTER_SIZE, int STRIDE>
-__global__ void im2colConvDepthwiseBackward(
+static __global__ void im2colConvDepthwiseBackward(
         float* __restrict__ tensorOut,
         const float* __restrict__ tensorIn,
         const int outHWSize,
@@ -355,7 +355,7 @@ template <
     int BLOCK_Y_SIZE,
     int FILTER_SIZE,
     int STRIDE
-> __global__
+> static __global__
 void tiledDepthwiseConvForward(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,
@@ -478,7 +478,7 @@ template <
     int BLOCK_Y_SIZE,
     int FILTER_SIZE,
     int STRIDE
-> __global__
+> static __global__
 void tiledDepthwiseConvBackward(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,

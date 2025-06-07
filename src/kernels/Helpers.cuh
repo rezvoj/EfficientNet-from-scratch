@@ -1,6 +1,17 @@
 
+struct Multiply {
+    __forceinline__ __device__
+    float operator()(const float a, const float b) const { return a * b; }
+};
+
+
+struct Add {
+    __forceinline__ __device__
+    float operator()(const float a, const float b) const { return a + b; }
+};
+
 template <typename Operation>
-__global__ 
+static __global__ 
 void elementwiseOpInplace(
         float* __restrict__ tensor, 
         const uint size) {
@@ -12,7 +23,7 @@ void elementwiseOpInplace(
 
 
 template <typename Operation>
-__global__
+static __global__
 void elementwiseOp(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,
@@ -26,7 +37,7 @@ void elementwiseOp(
 
 // cublasSscal? (division, multiplication)
 template <typename Operation>
-__global__ 
+static __global__ 
 void elementwiseScalarOpInplace(
         float* __restrict__ tensor,
         const float value,
@@ -39,7 +50,7 @@ void elementwiseScalarOpInplace(
 
 
 template <typename Operation>
-__global__
+static __global__
 void elementwiseScalarOp(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,
@@ -54,7 +65,7 @@ void elementwiseScalarOp(
 
 // cublasSaxpy ? (multiply and add)
 template <typename Operation>
-__global__ 
+static __global__ 
 void elementwise2TensorOpInplace(
         float* __restrict__ toTensor, 
         const float* __restrict__ fromTensor, 
@@ -67,7 +78,7 @@ void elementwise2TensorOpInplace(
 
 
 template <typename Operation>
-__global__ 
+static __global__ 
 void elementwise2TensorOp(
         float* __restrict__ outTensor,
         const float* __restrict__ tensorA,
