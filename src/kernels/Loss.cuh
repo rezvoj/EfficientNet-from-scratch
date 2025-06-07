@@ -7,7 +7,7 @@
 // Input logits shape: [B, NumClasses]
 // Output probs shape: [B, NumClasses]
 // Labels shape: [B] (one integer label per batch item)
-__global__ void softmaxCrossEntropyFwd(
+static __global__ void softmaxCrossEntropyFwd(
     float* __restrict__ loss,
     float* __restrict__ probs,
     const float* __restrict__ logits,
@@ -62,7 +62,7 @@ __global__ void softmaxCrossEntropyFwd(
 // The backward pass for Softmax + Cross-Entropy is remarkably simple:
 // dLoss/dLogit_i = (Prob_i - 1) if i is the correct class
 // dLoss/dLogit_i =  Prob_i      if i is any other class
-__global__ void softmaxCrossEntropyBwd(
+static __global__ void softmaxCrossEntropyBwd(
     float* __restrict__ d_logits, // Output: gradients w.r.t logits
     const float* __restrict__ probs,    // Input: probabilities from fwd pass
     const int* __restrict__ labels,   // Input: true labels

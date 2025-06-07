@@ -62,7 +62,7 @@ static __global__ void im2colConv(
         const int inCBIdxPart = CBIdx * inHSize * inWSize;
         pointValue = tensorIn[inCBIdxPart + inPointHIdx * inWSize + inPointWIdx];
     }
-    tensorOut[tIdx] = pointValue
+    tensorOut[tIdx] = pointValue;
 }
 
 
@@ -133,7 +133,7 @@ static __global__ void im2colConvBackward(
         const int inHWIndex = inPointHIdx * inWSize + inPointWIdx;
         pointValue = tensorIn[inCBIdxPart + inHWIndex];
     }
-    tensorOut[tIdx] = pointValue
+    tensorOut[tIdx] = pointValue;
 }
 
 
@@ -322,7 +322,7 @@ static __global__ void im2colConvDepthwiseBackward(
         const int inCBIdxPart = CBIdx * inHSize * inWSize;
         pointValue = tensorIn[inCBIdxPart + inPointHIdx * inWSize + inPointWIdx];
     }
-    tensorOut[tIdx] = pointValue
+    tensorOut[tIdx] = pointValue;
 }
 
 
@@ -524,8 +524,9 @@ void tiledDepthwiseConvBackward(
     }
     __syncthreads();    
     // Calculate in padding offset W and H first needed value indexes for the block
-    const int inWFirstNeededIdx = ceilDiv(blockIdx.x * BLOCK_X_SIZE - FILTER_PADD_SIZE, STRIDE);
-    const int inHFirstNeededIdx = ceilDiv(blockIdx.y % outHBlocks * BLOCK_Y_SIZE - FILTER_PADD_SIZE, STRIDE);
+    // FIX: Cast the arguments to 'int' to resolve template ambiguity
+    const int inWFirstNeededIdx = ceilDiv((int)(blockIdx.x * BLOCK_X_SIZE - FILTER_PADD_SIZE), (int)STRIDE);
+    const int inHFirstNeededIdx = ceilDiv((int)(blockIdx.y % outHBlocks * BLOCK_Y_SIZE - FILTER_PADD_SIZE), (int)STRIDE);
     // Calculate in C * B flat index part for input indexes
     const int CBIdx = CIdx * BSize + BIdx;
     const int inCBIdxPart = CBIdx * inHSize * inWSize;
