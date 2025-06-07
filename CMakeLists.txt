@@ -1,0 +1,37 @@
+cmake_minimum_required(VERSION 3.18)
+project(efficientnet_implementation LANGUAGES CXX CUDA)
+
+if(WIN32)
+else()
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
+
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+    find_package(CUDAToolkit REQUIRED)
+    find_package(OpenCV REQUIRED COMPONENTS core imgcodecs)
+
+    set(TARGET_ARCH "86")
+    set(CMAKE_CUDA_ARCHITECTURES "${TARGET_ARCH}")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --generate-code=arch=compute_${TARGET_ARCH},code=sm_${TARGET_ARCH}")
+    set(CMAKE_CXX_FLAGS "-O3 -march=native -mtune=native")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --fmad=true --use_fast_math")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic -Werror")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wconversion -Wsign-conversion -Wfloat-conversion")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-Wall,-Wextra,-Werror")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-Wconversion,-Wsign-conversion,-Wfloat-conversion")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --display-error-number")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --Werror all-warnings")
+
+    add_executable(benchmarks src/Benchmarks.cu)
+    add_executable(tests src/Tests.cu)
+    add_executable(train src/Train.cu src/Dataset.cu src/Network.cu)
+    add_executable(evaluate src/Evaluate.cu src/Dataset.cu src/Network.cu)
+
+    target_link_libraries(benchmarks PUBLIC cudnn cublas curand)
+    target_link_libraries(tests PUBLIC cudnn cublas curand)
+    target_link_libraries(train PUBLIC cudnn cublas curand ${OpenCV_LIBS})
+    target_link_libraries(evaluate PUBLIC cudnn cublas curand ${OpenCV_LIBS})
+endif()

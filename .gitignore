@@ -1,3 +1,6 @@
+env/
+.env/
+.pyenv/
 CMakeCache.txt
 CMakeFiles/
 *.cmake
@@ -24,6 +27,7 @@ cmake-build-*/
 
 build/
 .tmp/
+.old/
 .data/
 
 Thumbs.db
