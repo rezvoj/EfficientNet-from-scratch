@@ -25,7 +25,9 @@ cmake-build-*/
 build/
 .tmp/
 .data/
-
+resources/dev
+resources/data/cifar-10-batches-bin/
+resources/data/cifar10/*
 Thumbs.db
 *~
 *.swp
