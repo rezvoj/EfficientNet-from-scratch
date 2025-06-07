@@ -124,7 +124,7 @@ void depthwiseConvForward(
 
 
 /**
- * @brief Computes the gradient tensor dLoss/dI = dLoss/dO ∗ 180° rotated filter.
+ * @brief Computes the gradient tensor dLoss/dI = expanded dLoss/dO ∗ 180° rotated filter.
  *
  * @tparam BLOCK_X_SIZE Number of threads in the x-dimension of a block.
  * @tparam BLOCK_Y_SIZE Number of threads in the y-dimension of a block.
