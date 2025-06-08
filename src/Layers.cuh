@@ -189,8 +189,8 @@ public:
             throw NNException("Layer needs to be connected.");
         }
         if (currBatchSize != batchSize) {
-            checkCuda(cudaFree(d_copyTensor));
             currBatchSize = batchSize;
+            checkCuda(cudaFree(d_copyTensor));
             checkCuda(cudaMalloc(&d_copyTensor, batchSize * inputSize.fullSize() * sizeof(float)));
         }
         const size_t copySize = currBatchSize * inputSize.fullSize() * sizeof(float);
@@ -383,20 +383,113 @@ public:
 
 
 
+class DropoutLayer : public Layer {
+private:
+    bool dropON;
+    float dropoutRate;
+    size_t dropoutSeed;
+    void* d_cudnnDropoutStates;
+    void* d_cudnnReserveSpace;
+    cudnnHandle_t cudnnHandle;
+    size_t cudnnDropoutStatesSize;
+    size_t cudnnReserveSpaceSize;
+    cudnnDropoutDescriptor_t cudnnDropoutDesc;
+    cudnnTensorDescriptor_t cudnnTensorDesc;
+
+public:
+    DropoutLayer(
+            const TensorSize inputSize,
+            const float rate,
+            const size_t seed,
+            const cudnnHandle_t handle): 
+                Layer(inputSize, inputSize),
+                dropON(false),
+                dropoutRate(rate),
+                dropoutSeed(seed),
+                d_cudnnDropoutStates(nullptr),
+                d_cudnnReserveSpace(nullptr),
+                cudnnHandle(handle),
+                cudnnReserveSpaceSize(0) {
+        checkCudnn(cudnnCreateDropoutDescriptor(&cudnnDropoutDesc));
+        checkCudnn(cudnnDropoutGetStatesSize(cudnnHandle, &cudnnDropoutStatesSize));
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnTensorDesc));
+    }
+
+    void _NNtoggleGrad(const bool gradON) override {
+        if (!dropON && gradON) {
+            dropON = true;
+            checkCuda(cudaMalloc(&d_cudnnDropoutStates, cudnnDropoutStatesSize));
+            checkCudnn(cudnnSetDropoutDescriptor(
+                cudnnDropoutDesc, cudnnHandle, dropoutRate,
+                d_cudnnDropoutStates, cudnnDropoutStatesSize, dropoutSeed
+            ));
+        }
+        else if (dropON && !gradON) {
+            dropON = false;
+            checkCuda(cudaFree(d_cudnnDropoutStates));
+            checkCuda(cudaFree(d_cudnnReserveSpace));
+            d_cudnnDropoutStates = nullptr;
+            d_cudnnReserveSpace = nullptr;
+            cudnnReserveSpaceSize = 0;
+            currBatchSize = 0;
+        }
+    };
+
+    void _NNforward(float* d_borrowTensor, const size_t batchSize) override {
+        if (next == nullptr) throw NNException("Layer needs to be connected.");
+        if (dropON) {
+            if (currBatchSize != batchSize) {
+                currBatchSize = batchSize;
+                checkCudnn(cudnnSetTensor4dDescriptor(
+                    cudnnTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                    currBatchSize, inputSize.ZSize, inputSize.YSize, inputSize.XSize
+                ));
+                checkCuda(cudaFree(d_cudnnReserveSpace));
+                checkCudnn(cudnnDropoutGetReserveSpaceSize(cudnnTensorDesc, &cudnnReserveSpaceSize));
+                checkCuda(cudaMalloc(&d_cudnnReserveSpace, cudnnReserveSpaceSize));
+            }
+            checkCudnn(cudnnDropoutForward(
+                cudnnHandle, cudnnDropoutDesc,
+                cudnnTensorDesc, d_borrowTensor,
+                cudnnTensorDesc, d_borrowTensor,   
+                d_cudnnReserveSpace, cudnnReserveSpaceSize
+            ));
+        }
+        next->_NNforward(d_borrowTensor, batchSize);
+    }
+
+    void _NNbackward(float* d_replaceTensor) override {
+        if (prev == nullptr) throw NNException("Layer needs to be connected.");
+        if (dropON) {
+            checkCudnn(cudnnDropoutBackward(
+                cudnnHandle, cudnnDropoutDesc,
+                cudnnTensorDesc, d_replaceTensor,
+                cudnnTensorDesc, d_replaceTensor,   
+                d_cudnnReserveSpace, cudnnReserveSpaceSize
+            ));
+        }
+        prev->_NNbackward(d_replaceTensor);
+    }
+
+    ~DropoutLayer() override {
+        checkCuda(cudaFree(d_cudnnDropoutStates));
+        checkCuda(cudaFree(d_cudnnReserveSpace));
+        checkCudnn(cudnnDestroyDropoutDescriptor(cudnnDropoutDesc));
+        checkCudnn(cudnnDestroyTensorDescriptor(cudnnTensorDesc));
+    }
+};
 
 
 
 
 
+// Conv2D (cuDNN)
+// Conv2DDepthwise (Own kernels)
+// Linear (own / cuBLASS)
 
+// Softmax (cuDNN)
+// BatchNorm (cuDNN)
 
-// Conv2D
-// Conv2DDepthwise
-// Linear
+// Pooling / Expansion (Own Kernels)
+// Activation (Own Kernels)
 
-// Softmax
-// BatchNorm
-// Pooling / Expansion
-
-// Activation
-// Dropout
