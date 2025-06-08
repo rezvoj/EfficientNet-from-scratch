@@ -1,5 +1,6 @@
 #pragma once
 #include <stdexcept>
+#include <cudnn.h>
 
 
 
@@ -22,6 +23,21 @@ void checkCudaLastError() {
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw CudaException(err);
+    }
+}
+
+
+class CudnnException : public std::runtime_error {
+public:
+    CudnnException(const cudnnStatus_t status) :
+        std::runtime_error(cudnnGetErrorString(status)) {}
+};
+
+
+__forceinline__
+void checkCudnn(const cudnnStatus_t status) {
+    if (status != CUDNN_STATUS_SUCCESS) {
+        throw CudnnException(status);
     }
 }
 
