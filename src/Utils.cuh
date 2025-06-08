@@ -42,6 +42,12 @@ void checkCudnn(const cudnnStatus_t status) {
 }
 
 
+class NNException : public std::runtime_error {
+    public: NNException(const std::string& errorMessage): 
+        std::runtime_error(errorMessage) {}
+};
+
+
 __forceinline__
 void cudaStartMeasuringTime(cudaEvent_t* start, cudaEvent_t* stop) {
     checkCuda(cudaEventCreate(start));
