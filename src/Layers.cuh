@@ -460,14 +460,12 @@ public:
 
     void _NNbackward(float* d_replaceTensor) override {
         if (prev == nullptr) throw NNException("Layer needs to be connected.");
-        if (dropON) {
-            checkCudnn(cudnnDropoutBackward(
-                cudnnHandle, cudnnDropoutDesc,
-                cudnnTensorDesc, d_replaceTensor,
-                cudnnTensorDesc, d_replaceTensor,   
-                d_cudnnReserveSpace, cudnnReserveSpaceSize
-            ));
-        }
+        checkCudnn(cudnnDropoutBackward(
+            cudnnHandle, cudnnDropoutDesc,
+            cudnnTensorDesc, d_replaceTensor,
+            cudnnTensorDesc, d_replaceTensor,   
+            d_cudnnReserveSpace, cudnnReserveSpaceSize
+        ));
         prev->_NNbackward(d_replaceTensor);
     }
 
@@ -481,6 +479,70 @@ public:
 
 
 
+template <typename ACTIVATION>
+class ActivationLayer : public Layer {
+private:
+    bool keepInputON;
+    float* d_Tensor;
+
+public:
+    ActivationLayer(const TensorSize inputSize): 
+            Layer(inputSize, inputSize),
+            keepInputON(false),
+            d_Tensor(nullptr) {}
+    
+    void _NNtoggleGrad(const bool gradON) override {
+        if (!keepInputON && gradON) keepInputON = true;
+        else if (keepInputON && !gradON) {
+            keepInputON = false;
+            checkCuda(cudaFree(d_Tensor));
+            d_Tensor = nullptr;
+            currBatchSize = 0;
+        }
+    };
+
+    void _NNforward(float* d_borrowTensor, const size_t batchSize) override {
+        if (next == nullptr) throw NNException("Layer needs to be connected.");
+        if (keepInputON) {
+            if (currBatchSize != batchSize) {
+                currBatchSize = batchSize;
+                checkCuda(cudaFree(d_Tensor));
+                checkCuda(cudaMalloc(&d_Tensor, batchSize * inputSize.fullSize() * sizeof(float)));
+            }
+            const size_t fullSize = currBatchSize * inputSize.fullSize();
+            elementwiseActivation<ACTIVATION>
+                <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_Tensor, d_borrowTensor, fullSize); 
+            checkCudaLastError();
+            std::swap(d_borrowTensor, d_Tensor);
+        }
+        else {
+            const size_t fullSize = currBatchSize * inputSize.fullSize();
+            elementwiseActivationInplace<ACTIVATION>
+                <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_borrowTensor, fullSize);
+            checkCudaLastError();
+        }
+        next->_NNforward(d_borrowTensor, batchSize);
+    }
+
+    void _NNbackward(float* d_replaceTensor) override {
+        if (prev == nullptr) throw NNException("Layer needs to be connected.");
+        const size_t fullSize = currBatchSize * inputSize.fullSize();
+        elementwiseActivationBackwardInplace<ACTIVATION>
+            <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_replaceTensor, d_Tensor, fullSize); 
+        checkCudaLastError();
+        prev->_NNbackward(d_replaceTensor);
+    }
+
+    ~ActivationLayer() override {
+        checkCuda(cudaFree(d_Tensor));
+    }
+};
+
+
+
+
+
+
 
 
 // Conv2D (cuDNN)
@@ -491,5 +553,3 @@ public:
 // BatchNorm (cuDNN)
 
 // Pooling / Expansion (Own Kernels)
-// Activation (Own Kernels)
-
