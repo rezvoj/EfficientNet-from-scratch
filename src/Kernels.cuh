@@ -493,18 +493,30 @@ void elementwiseMul(
 
 
 __global__
-void elementwiseMulBackwardInplace(
-        float* __restrict__ outTensorA,
-        float* __restrict__ outTensorB,
-        const float* __restrict__ tensor,
+void elementwiseMulInplace(
+        float* __restrict__ tensorA,
+        const float* __restrict__ inTensorB,
         const uint size) {
     const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
     if (tIdx >= size) return;
-    const float valueA = outTensorA[tIdx];
-    const float valueB = outTensorB[tIdx];
-    const float gradValue = tensor[tIdx];
-    outTensorA[tIdx] = gradValue * valueB;
-    outTensorB[tIdx] = gradValue * valueA;
+    tensorA[tIdx] *= inTensorB[tIdx];
+};
+
+
+
+__global__
+void elementwiseMulBackwardInplace(
+        float* __restrict__ tensorA,
+        float* __restrict__ tensorB,
+        const float* __restrict__ inGradTensor,
+        const uint size) {
+    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tIdx >= size) return;
+    const float valueA = tensorA[tIdx];
+    const float valueB = tensorB[tIdx];
+    const float ValueGrad = inGradTensor[tIdx];
+    tensorA[tIdx] = ValueGrad * valueB;
+    tensorB[tIdx] = ValueGrad * valueA;
 };
 
 
@@ -598,6 +610,34 @@ void elementwiseActivationBackwardInplace(
     const float y = ACTIVATION::forward(x);
     outTensor[tIdx] *= ACTIVATION::backward(x, y);
 }
+
+
+
+__global__ 
+void expansionForward(
+        float* __restrict__ outTensor,
+        const float* __restrict__ inTensor,
+        const uint fullSize,
+        const uint outHWSize) {
+    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tIdx >= fullSize) return;
+    const uint inIdx = tIdx / outHWSize;
+    outTensor[tIdx] = inTensor[inIdx];
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -744,31 +784,31 @@ void elementwise2TensorOp(
 }
 
 
-template <uint TensorDim>
-__global__
-void reshapeTensor(
-        float* __restrict__ tensorOut,
-        const float* __restrict__ tensorIn,
-        const uint outRowSize,
-        const uint outOrder[TensorDim],
-        const uint outDimSizeSums[TensorDim],
-        const uint inDimSizeSums[TensorDim]) {
-    const uint outFullIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint outIdxes[TensorDim];
-    uint outCurrIdx = outFullIdx;
-    for (uint dimIdx = 0; dimIdx < TensorDim; ++dimIdx) {
-        const uint currentDimSizeSum = outDimSizeSums[dimIdx];
-        outIdxes[dimIdx] = outCurrIdx / currentDimSizeSum;
-        outCurrIdx = outCurrIdx % currentDimSizeSum;
-    }
-    float value = 0.0f;
-    if (outIdxes[TensorDim - 1] < outRowSize) {
-        uint inFullIdx = 0;
-        for (uint dimIdx = 0; dimIdx < TensorDim; ++dimIdx) {
-            const uint currDimIdx = outIdxes[outOrder[dimIdx]];
-            inFullIdx += currDimIdx * inDimSizeSums[currDimIdx];
-        }
-        value = tensorIn[inFullIdx];
-    }
-    tensorOut[outFullIdx] = value;
-}
+// template <uint TensorDim>
+// __global__
+// void reshapeTensor(
+//         float* __restrict__ tensorOut,
+//         const float* __restrict__ tensorIn,
+//         const uint outRowSize,
+//         const uint outOrder[TensorDim],
+//         const uint outDimSizeSums[TensorDim],
+//         const uint inDimSizeSums[TensorDim]) {
+//     const uint outFullIdx = blockIdx.x * blockDim.x + threadIdx.x;
+//     uint outIdxes[TensorDim];
+//     uint outCurrIdx = outFullIdx;
+//     for (uint dimIdx = 0; dimIdx < TensorDim; ++dimIdx) {
+//         const uint currentDimSizeSum = outDimSizeSums[dimIdx];
+//         outIdxes[dimIdx] = outCurrIdx / currentDimSizeSum;
+//         outCurrIdx = outCurrIdx % currentDimSizeSum;
+//     }
+//     float value = 0.0f;
+//     if (outIdxes[TensorDim - 1] < outRowSize) {
+//         uint inFullIdx = 0;
+//         for (uint dimIdx = 0; dimIdx < TensorDim; ++dimIdx) {
+//             const uint currDimIdx = outIdxes[outOrder[dimIdx]];
+//             inFullIdx += currDimIdx * inDimSizeSums[currDimIdx];
+//         }
+//         value = tensorIn[inFullIdx];
+//     }
+//     tensorOut[outFullIdx] = value;
+// }

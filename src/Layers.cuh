@@ -11,18 +11,18 @@ constexpr size_t BLOCK_Y_SIZE = 16;
 
 
 struct TensorSize {
-    size_t ZSize = 1;
-    size_t YSize = 1;
-    size_t XSize = 1;
+    size_t C = 1;
+    size_t H = 1;
+    size_t W = 1;
     
     size_t fullSize() const {
-        return ZSize * YSize * XSize;
+        return C * H * W;
     }
 
     bool operator==(const TensorSize& other) const {
-        return ZSize == other.ZSize
-                && YSize == other.YSize
-                && XSize == other.XSize;
+        return C == other.C
+                && H == other.H
+                && W == other.W;
     }
 
     bool operator!=(const TensorSize& other) const {
@@ -40,6 +40,11 @@ class Optimizer {
 
 
 
+// When grad is OFF during inference the layer just borrows the memory to the next layer.
+// During training the model expects to have the memory it borrowed or same size memory
+// to get returned (traded back) by the following layer fulfilling the "Memory Contract".
+// After forward call when grad is ON, the layer is in non atomic and destroying it or
+// toggling grad would result in undefined state or crash. 
 class Layer {
 protected:
     TensorSize inputSize;
@@ -54,112 +59,22 @@ public:
             currBatchSize(0),
             prev(nullptr),
             next(nullptr) {}
-
-    /**
-     * @brief Sets the preceding layer in the network graph.
-     * @param prevLayer A pointer to the layer that comes before this one.
-     */
-    void _NNsetPrev(Layer* prevLayer) { prev = prevLayer; }
-
-    /**
-     * @brief Virtual destructor.
-     * 
-     * @note Memory Contract: The destructor of any derived Layer is responsible for freeing
-     *       any GPU memory buffer that the layer instance OWNS AT THE MOMENT OF DESTRUCTION.
-     *       Due to the memory exchange contract, this may not be the same buffer the
-     *       layer originally allocated.
-     * 
-     * @warning Contract Violation: Under the "Memory Exchange" contract (i.e., when training
-     *          with gradients enabled), it is illegal to destroy a layer after its forward()
-     *          pass has been called but before its corresponding backward() pass has completed.
-     *          Doing so will break the ownership chain and result in memory corruption or a crash.
-     */
     virtual ~Layer() {}
-
-    /**
-     * @brief Connects this layer to the next layer in the network graph.
-     * @param nextLayer A pointer to the layer that will follow this one.
-     */
+    void setPrev(Layer* prevLayer) { prev = prevLayer; }
     virtual void append(Layer* nextLayer) {
-        if (nextLayer->_NNgetInputSize() != outputSize) {
-            throw NNException("Invalid layer input tensor size.");
-        }
-        if (next == nullptr) next = nextLayer;
-        else throw NNException("Layer already connected.");
-        nextLayer->_NNsetPrev(this);
+        next = nextLayer;
+        nextLayer->setPrev(this);
     }
-
-    /**
-     * @brief Toggles gradient calculation and memory model for training vs. inference.
-     * @param gradON If true, enables gradient calculations and the "Memory Exchange" ownership model.
-     *               If false, disables gradients and uses a "Memory Borrowing" model.
-     * 
-     * @note Default State & Usage Rules:
-     *       The default gradient state for any new Layer is Off (inference mode).
-     *       Calling the `backward()` method is illegal when the gradient state is Off.
-     * 
-     * @warning Contract Violation: It is illegal to call this function after a forward() pass
-     *          has been initiated and before its corresponding backward() pass has completed.
-     *          Changing the memory model mid-operation will break the ownership chain and
-     *          result in undefined behavior, memory corruption, or a crash. This function
-     *          should only be called between training steps or before inference begins.
-     */
-    virtual void _NNtoggleGrad([[maybe_unused]] const bool gradON) {};
-
-    /**
-     * @brief Performs the forward propagation of data through the layer.
-     * @param d_inputTensor Pointer to the input tensor data on the GPU.
-     * @param batchSize The number of items in the current batch.
-     *
-     * @note Memory Contract (Training - Grads ON):
-     *       This layer TAKES OWNERSHIP of the memory pointed to by d_inputTensor.
-     *       It is now responsible for managing this memory buffer. It will either pass
-     *       ownership of this same buffer to the next layer or pass ownership of a new
-     *       buffer it creates.
-     *
-     * @note Memory Contract (Inference - Grads OFF):
-     *       This layer BORROWS the memory pointed to by d_inputTensor. It does not
-     *       take ownership and must not free it. It will perform its calculations
-     *       and pass a borrowed pointer to the next layer.
-     */
-    virtual void _NNforward(float* d_inputTensor, const size_t batchSize) = 0;
-
-    /**
-     * @brief Performs the backward propagation of gradients through the layer.
-     * @param d_gradientTensor Pointer to the gradient tensor from the subsequent layer.
-     *
-     * @note Memory Contract (Training only):
-     *       This layer TAKES OWNERSHIP of the memory pointed to by d_gradientTensor.
-     *       This completes the "memory exchange" initiated in the forward pass. The layer
-     *       is now responsible for this buffer. It will then perform its gradient
-     *       calculations and pass ownership of a gradient buffer to its previous layer
-     *       via its own backward() call.
-     *
-     * @note State Dependency: This method implicitly depends on the state (e.g., batchSize)
-     *       set by the most recent forward() call. It is invalid to call backward()
-     *       without a preceding forward() call within the same training step.
-     */
-    virtual void _NNbackward(float* d_gradientTensor) = 0;
-
-    /**
-     * @brief Applies an optimization algorithm to update layer parameters.
-     * @param optimizer The optimizer object containing the update logic.
-     */
-    virtual void _NNoptimize(const Optimizer& optimizer) {
-        if (next == nullptr) throw NNException("Layer needs to be connected.");
-        next->_NNoptimize(optimizer);
-    }
-
-    /**
-     * @brief Gets the expected tensor size for a single item (excluding the batch dimension).
-     * @return A TensorSize struct describing the C, H, W dimensions.
-     */
-    virtual TensorSize _NNgetInputSize() const { return inputSize; }
-
+    virtual void toggleGrad([[maybe_unused]] const bool gradON) {};
+    virtual void forward(float* d_inputTensor, const size_t batchSize) = 0;
+    virtual void backward(float* d_gradientTensor) = 0;
+    virtual void optimize(const Optimizer& optimizer) { next->optimize(optimizer); }
 };
 
 
 
+// The layers must be appended in the same order as the corresponding 
+// merge layer is later connected to the previous layers.
 class SplitLayer : public Layer {
 private:
     float* d_copyTensor;
@@ -173,36 +88,25 @@ public:
             next2(nullptr),
             partialBackward(false) {}
 
-    // Must be appended in the same order as the corresponding merge is to the paths
     void append(Layer* nextLayer) override {
-        if (nextLayer->_NNgetInputSize() != outputSize) {
-            throw NNException("Invalid layer input tensor size.");
-        }
         if (next == nullptr) next = nextLayer;
-        else if (next2 == nullptr) next2 = nextLayer;
-        else throw NNException("Layer already connected.");
-        nextLayer->_NNsetPrev(this);
+        else next2 = nextLayer;
+        nextLayer->setPrev(this);
     }
 
-    void _NNforward(float* d_borrowTensor, const size_t batchSize) override {
-        if (next2 == nullptr || next2 == nullptr) {
-            throw NNException("Layer needs to be connected.");
-        }
+    void forward(float* d_borrowTensor, const size_t batchSize) override {
+        const size_t fullSizeBytes = batchSize * inputSize.fullSize() * sizeof(float);
         if (currBatchSize != batchSize) {
             currBatchSize = batchSize;
             checkCuda(cudaFree(d_copyTensor));
-            checkCuda(cudaMalloc(&d_copyTensor, batchSize * inputSize.fullSize() * sizeof(float)));
+            checkCuda(cudaMalloc(&d_copyTensor, fullSizeBytes));
         }
-        const size_t copySize = currBatchSize * inputSize.fullSize() * sizeof(float);
-        checkCuda(cudaMemcpy(d_copyTensor, d_borrowTensor, copySize, cudaMemcpyDeviceToDevice));
-        next->_NNforward(d_borrowTensor, currBatchSize);
-        next2->_NNforward(d_copyTensor, currBatchSize);
+        checkCuda(cudaMemcpy(d_copyTensor, d_borrowTensor, fullSizeBytes, cudaMemcpyDeviceToDevice));
+        next->forward(d_borrowTensor, batchSize);
+        next2->forward(d_copyTensor, batchSize);
     }
 
-    void _NNbackward(float* d_replaceTensor) override {
-        if (prev == nullptr) {
-            throw NNException("Layer needs to be connected.");
-        }
+    void backward(float* d_replaceTensor) override {
         if (!partialBackward) {
             d_copyTensor = d_replaceTensor;
             partialBackward = true;
@@ -212,16 +116,14 @@ public:
         const size_t fullSize = currBatchSize * inputSize.fullSize();
         elementwiseAddInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
             d_replaceTensor, d_copyTensor, fullSize
-        ); checkCudaLastError();
-        prev->_NNbackward(d_replaceTensor);
+        );
+        checkCudaLastError();
+        prev->backward(d_replaceTensor);
     }
 
-    void _NNoptimize(const Optimizer& optimizer) override {
-        if (next == nullptr || next2 == nullptr) {
-            throw NNException("Layer needs to be connected.");
-        }
-        next->_NNoptimize(optimizer);
-        next2->_NNoptimize(optimizer);
+    void optimize(const Optimizer& optimizer) override {
+        next->optimize(optimizer);
+        next2->optimize(optimizer);
     }
 
     ~SplitLayer() override {
@@ -231,8 +133,11 @@ public:
 
 
 
-class MulMergeLayer : public Layer {
+// The layer must be appended to the previous layers in the same order as 
+// the paths were appended into the corresponding split layer.
+class MulMergeBroadcastedLayer : public Layer {
 private:
+    bool backON;
     float* d_outTensor;
     Layer* prev2;
     float* d_prev1Tensor;
@@ -240,7 +145,7 @@ private:
     bool partialForward;
 
 public:
-    MulMergeLayer(const TensorSize inputSize): 
+    MulMergeBroadcastedLayer(const TensorSize inputSize): 
             Layer(inputSize, inputSize),
             d_outTensor(nullptr),
             prev2(nullptr),
@@ -248,47 +153,65 @@ public:
             d_prev2Tensor(nullptr),
             partialForward(false) {}
 
-    void _NNforward(float* d_borrowTensor, const size_t batchSize) override {
-        if (next == nullptr) throw NNException("Layer needs to be connected.");
+     void toggleGrad(const bool gradON) override {
+        if (!backON && gradON) backON = true;
+        else if (backON && !gradON) {
+            backON = false;
+            checkCuda(cudaFree(d_outTensor));
+            d_outTensor = nullptr;
+            currBatchSize = 0;
+        }    
+    };
+
+    void forward(float* d_borrowTensor, const size_t batchSize) override {
+        const size_t fullSize = batchSize * inputSize.fullSize();
         if (!partialForward) {
-            if (currBatchSize != batchSize) {
+            if (backON && currBatchSize != batchSize) {
                 currBatchSize = batchSize;
                 checkCuda(cudaFree(d_outTensor));
-                checkCuda(cudaMalloc(&d_outTensor, batchSize * inputSize.fullSize() * sizeof(float)));
+                checkCuda(cudaMalloc(&d_outTensor, fullSize * sizeof(float)));
             }
             d_prev1Tensor = d_borrowTensor;
             return;
         }
-        d_prev2Tensor = d_borrowTensor;
-        const size_t fullSize = currBatchSize * inputSize.fullSize();
-        elementwiseMul<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-            d_outTensor, d_prev1Tensor, d_prev2Tensor, fullSize
-        ); checkCudaLastError();
-        next->_NNforward(d_outTensor, currBatchSize);
+        if (backON) {
+            d_prev2Tensor = d_borrowTensor;
+            elementwiseMul<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+                d_outTensor, d_prev1Tensor, d_prev2Tensor, fullSize
+            );
+            checkCudaLastError();
+            next->forward(d_outTensor, batchSize);
+            return;
+        }
+        elementwiseMulInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_prev1Tensor, d_prev2Tensor, fullSize
+        );
+        checkCudaLastError();
+        next->forward(d_prev1Tensor, batchSize);
     }
 
-    void _NNbackward(float* d_replaceTensor) override {
-        if (prev == nullptr || prev2 == nullptr) {
-            throw NNException("Layer needs to be connected.");
-        }
+    void backward(float* d_replaceTensor) override {
         d_outTensor = d_replaceTensor;
         const size_t fullSize = currBatchSize * inputSize.fullSize();
         elementwiseMulBackwardInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
             d_prev2Tensor, d_prev1Tensor, d_outTensor, fullSize
-        ); checkCudaLastError();
-        prev2->_NNbackward(d_prev2Tensor);
-        prev->_NNbackward(d_prev1Tensor);
+        ); 
+        checkCudaLastError();
+        prev2->backward(d_prev2Tensor);
+        prev->backward(d_prev1Tensor);
         d_prev2Tensor = nullptr;
         d_prev1Tensor = nullptr;
     }
 
-    ~MulMergeLayer() override {
+    ~MulMergeBroadcastedLayer() override {
         checkCuda(cudaFree(d_outTensor));
     }
 };
 
 
 
+// The layer must be appended to the previous layers in the same order as 
+// the paths were appended into the corresponding split layer.
 class AddMergeLayer : public Layer {
 private:
     Layer* prev2;
@@ -302,28 +225,24 @@ public:
             d_prevTensor(nullptr),
             partialForward(false) {}
 
-    void _NNforward(float* d_borrowTensor, const size_t batchSize) override {
-        if (next == nullptr) throw NNException("Layer needs to be connected.");
+    void forward(float* d_borrowTensor, const size_t batchSize) override {
         if (!partialForward) {
             currBatchSize = batchSize;
             d_prevTensor = d_borrowTensor;
             return;
         }
-        const size_t fullSize = currBatchSize * inputSize.fullSize();
+        const size_t fullSize = batchSize * inputSize.fullSize();
         elementwiseAddInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
             d_borrowTensor, d_prevTensor, fullSize
         ); checkCudaLastError();
-        next->_NNforward(d_borrowTensor, currBatchSize);
+        next->forward(d_borrowTensor, batchSize);
     }
 
-    void _NNbackward(float* d_replaceTensor) override {
-        if (prev == nullptr || prev2 == nullptr) {
-            throw NNException("Layer needs to be connected.");
-        }
+    void backward(float* d_replaceTensor) override {
         const size_t copySize = currBatchSize * inputSize.fullSize() * sizeof(float);        
         checkCuda(cudaMemcpy(d_prevTensor, d_replaceTensor, copySize, cudaMemcpyDeviceToDevice));
-        prev2->_NNbackward(d_replaceTensor);
-        prev->_NNbackward(d_prevTensor);
+        prev2->backward(d_replaceTensor);
+        prev->backward(d_prevTensor);
         d_prevTensor = nullptr;
     }
 };
@@ -332,7 +251,7 @@ public:
 
 class StochasticDepthLayer : public Layer {
 private:
-    bool skipON;
+    bool backON;
     bool skippedForward;
     float retainRate;
     std::mt19937 randomGenerator;
@@ -341,7 +260,7 @@ private:
 public:
     StochasticDepthLayer(const TensorSize inputSize, const float rate): 
             Layer(inputSize, inputSize),
-            skipON(false),
+            backON(false),
             skippedForward(false),
             retainRate(rate) {
         std::random_device device;
@@ -349,35 +268,36 @@ public:
         distribution = std::uniform_real_distribution<>(0.0, 1.0);
     }
 
-    void _NNtoggleGrad(const bool gradON) override { skipON = gradON; };
+    void toggleGrad(const bool gradON) override { backON = gradON; };
 
-    void _NNforward(float* d_borrowTensor, const size_t batchSize) override {
-        if (next == nullptr) throw NNException("Layer needs to be connected.");
+    void forward(float* d_borrowTensor, const size_t batchSize) override {
+        currBatchSize = batchSize;
         float multiplier = 1.0;
-        if (!skipON) multiplier = retainRate;
+        if (!backON) multiplier = retainRate;
         else if (distribution(randomGenerator) < static_cast<double>(retainRate)) {
             multiplier = 0.0f;
             skippedForward = true;
         }
         if (multiplier != 1.0f) {
-            const size_t fullSize = currBatchSize * inputSize.fullSize();
+            const size_t fullSize = batchSize * inputSize.fullSize();
             elementwiseScalarMulInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
                 d_borrowTensor, retainRate, fullSize
-            ); checkCudaLastError();
+            );
+            checkCudaLastError();
         }    
-        next->_NNforward(d_borrowTensor, currBatchSize);
+        next->forward(d_borrowTensor, batchSize);
     }
 
-    void _NNbackward(float* d_replaceTensor) override {
-        if (prev == nullptr) throw NNException("Layer needs to be connected.");
+    void backward(float* d_replaceTensor) override {
         if (skippedForward) {
             skippedForward = false;
             const size_t fullSize = currBatchSize * inputSize.fullSize();
             elementwiseScalarMulInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
                 d_replaceTensor, 0.0f, fullSize
-            ); checkCudaLastError();
+            );
+            checkCudaLastError();
         }
-        prev->_NNbackward(d_replaceTensor);
+        prev->backward(d_replaceTensor);
     }
 };
 
@@ -385,7 +305,7 @@ public:
 
 class DropoutLayer : public Layer {
 private:
-    bool dropON;
+    bool backON;
     float dropoutRate;
     size_t dropoutSeed;
     void* d_cudnnDropoutStates;
@@ -403,7 +323,7 @@ public:
             const size_t seed,
             const cudnnHandle_t handle): 
                 Layer(inputSize, inputSize),
-                dropON(false),
+                backON(false),
                 dropoutRate(rate),
                 dropoutSeed(seed),
                 d_cudnnDropoutStates(nullptr),
@@ -415,17 +335,17 @@ public:
         checkCudnn(cudnnCreateTensorDescriptor(&cudnnTensorDesc));
     }
 
-    void _NNtoggleGrad(const bool gradON) override {
-        if (!dropON && gradON) {
-            dropON = true;
+    void toggleGrad(const bool gradON) override {
+        if (!backON && gradON) {
+            backON = true;
             checkCuda(cudaMalloc(&d_cudnnDropoutStates, cudnnDropoutStatesSize));
             checkCudnn(cudnnSetDropoutDescriptor(
                 cudnnDropoutDesc, cudnnHandle, dropoutRate,
                 d_cudnnDropoutStates, cudnnDropoutStatesSize, dropoutSeed
             ));
         }
-        else if (dropON && !gradON) {
-            dropON = false;
+        else if (backON && !gradON) {
+            backON = false;
             checkCuda(cudaFree(d_cudnnDropoutStates));
             checkCuda(cudaFree(d_cudnnReserveSpace));
             d_cudnnDropoutStates = nullptr;
@@ -435,14 +355,13 @@ public:
         }
     };
 
-    void _NNforward(float* d_borrowTensor, const size_t batchSize) override {
-        if (next == nullptr) throw NNException("Layer needs to be connected.");
-        if (dropON) {
+    void forward(float* d_borrowTensor, const size_t batchSize) override {
+        if (backON) {
             if (currBatchSize != batchSize) {
                 currBatchSize = batchSize;
                 checkCudnn(cudnnSetTensor4dDescriptor(
                     cudnnTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                    currBatchSize, inputSize.ZSize, inputSize.YSize, inputSize.XSize
+                    batchSize, inputSize.C, inputSize.H, inputSize.W
                 ));
                 checkCuda(cudaFree(d_cudnnReserveSpace));
                 checkCudnn(cudnnDropoutGetReserveSpaceSize(cudnnTensorDesc, &cudnnReserveSpaceSize));
@@ -455,18 +374,17 @@ public:
                 d_cudnnReserveSpace, cudnnReserveSpaceSize
             ));
         }
-        next->_NNforward(d_borrowTensor, batchSize);
+        next->forward(d_borrowTensor, batchSize);
     }
 
-    void _NNbackward(float* d_replaceTensor) override {
-        if (prev == nullptr) throw NNException("Layer needs to be connected.");
+    void backward(float* d_replaceTensor) override {
         checkCudnn(cudnnDropoutBackward(
             cudnnHandle, cudnnDropoutDesc,
             cudnnTensorDesc, d_replaceTensor,
             cudnnTensorDesc, d_replaceTensor,   
             d_cudnnReserveSpace, cudnnReserveSpaceSize
         ));
-        prev->_NNbackward(d_replaceTensor);
+        prev->backward(d_replaceTensor);
     }
 
     ~DropoutLayer() override {
@@ -482,55 +400,52 @@ public:
 template <typename ACTIVATION>
 class ActivationLayer : public Layer {
 private:
-    bool keepInputON;
+    bool backON;
     float* d_Tensor;
 
 public:
     ActivationLayer(const TensorSize inputSize): 
             Layer(inputSize, inputSize),
-            keepInputON(false),
+            backON(false),
             d_Tensor(nullptr) {}
     
-    void _NNtoggleGrad(const bool gradON) override {
-        if (!keepInputON && gradON) keepInputON = true;
-        else if (keepInputON && !gradON) {
-            keepInputON = false;
+    void toggleGrad(const bool gradON) override {
+        if (!backON && gradON) backON = true;
+        else if (backON && !gradON) {
+            backON = false;
             checkCuda(cudaFree(d_Tensor));
             d_Tensor = nullptr;
             currBatchSize = 0;
         }
     };
 
-    void _NNforward(float* d_borrowTensor, const size_t batchSize) override {
-        if (next == nullptr) throw NNException("Layer needs to be connected.");
-        if (keepInputON) {
+    void forward(float* d_borrowTensor, const size_t batchSize) override {
+        const size_t fullSize = batchSize * inputSize.fullSize();
+        if (backON) {
             if (currBatchSize != batchSize) {
                 currBatchSize = batchSize;
                 checkCuda(cudaFree(d_Tensor));
-                checkCuda(cudaMalloc(&d_Tensor, batchSize * inputSize.fullSize() * sizeof(float)));
+                checkCuda(cudaMalloc(&d_Tensor, fullSize * sizeof(float)));
             }
-            const size_t fullSize = currBatchSize * inputSize.fullSize();
             elementwiseActivation<ACTIVATION>
                 <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_Tensor, d_borrowTensor, fullSize); 
             checkCudaLastError();
             std::swap(d_borrowTensor, d_Tensor);
         }
         else {
-            const size_t fullSize = currBatchSize * inputSize.fullSize();
             elementwiseActivationInplace<ACTIVATION>
                 <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_borrowTensor, fullSize);
             checkCudaLastError();
         }
-        next->_NNforward(d_borrowTensor, batchSize);
+        next->forward(d_borrowTensor, batchSize);
     }
 
-    void _NNbackward(float* d_replaceTensor) override {
-        if (prev == nullptr) throw NNException("Layer needs to be connected.");
+    void backward(float* d_replaceTensor) override {
         const size_t fullSize = currBatchSize * inputSize.fullSize();
         elementwiseActivationBackwardInplace<ACTIVATION>
             <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_replaceTensor, d_Tensor, fullSize); 
         checkCudaLastError();
-        prev->_NNbackward(d_replaceTensor);
+        prev->backward(d_replaceTensor);
     }
 
     ~ActivationLayer() override {
@@ -540,7 +455,73 @@ public:
 
 
 
+class ExpansionLayer : public Layer {
+private:    
+    float* d_OutTensor;
+    float* d_prevTensor;
+    cudnnHandle_t cudnnHandle;
+    cudnnReduceTensorDescriptor_t cudnnReduceDesc;
+    cudnnTensorDescriptor_t cudnnInTensorDesc;
+    cudnnTensorDescriptor_t cudnnOutTensorDesc;
 
+public:
+    ExpansionLayer(const TensorSize outputSize, const cudnnHandle_t handle):
+            Layer(outputSize, outputSize),
+            d_OutTensor(nullptr),
+            d_prevTensor(nullptr),
+            cudnnHandle(handle) {
+        checkCudnn(cudnnCreateReduceTensorDescriptor(&cudnnReduceDesc));
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnInTensorDesc));
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnOutTensorDesc));
+        checkCudnn(cudnnSetReduceTensorDescriptor(
+            cudnnReduceDesc, CUDNN_REDUCE_TENSOR_ADD, CUDNN_DATA_FLOAT,
+            CUDNN_NOT_PROPAGATE_NAN, CUDNN_REDUCE_TENSOR_NO_INDICES, CUDNN_32BIT_INDICES
+        ));
+    }
+
+    void forward(float* d_borrowTensor, const size_t batchSize) override {
+        d_prevTensor = d_borrowTensor;
+        const size_t fullSize = batchSize * inputSize.fullSize();
+        if (currBatchSize != batchSize) {
+            currBatchSize = batchSize;
+            checkCuda(cudaFree(d_OutTensor));
+            checkCuda(cudaMalloc(&d_OutTensor, fullSize * sizeof(float)));
+            checkCudnn(cudnnSetTensor4dDescriptor(
+                cudnnInTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                batchSize, outputSize.C, 1, 1
+            ));
+            checkCudnn(cudnnSetTensor4dDescriptor(
+                cudnnOutTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                batchSize, outputSize.C, outputSize.H, outputSize.W
+            ));
+        }
+        expansionForward<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_OutTensor, d_prevTensor, fullSize, outputSize.H * outputSize.W
+        );
+        checkCudaLastError();
+        next->forward(d_OutTensor, batchSize);
+    }
+
+    void backward(float* d_replaceTensor) override {
+        d_OutTensor = d_replaceTensor;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        checkCudnn(cudnnReduceTensor(
+            cudnnHandle, cudnnReduceDesc,
+            nullptr, 0, nullptr, 0,
+            &alpha, cudnnOutTensorDesc, d_OutTensor,
+            &beta, cudnnInTensorDesc, d_prevTensor
+        ));
+        prev->backward(d_prevTensor);
+    }
+
+    ~ExpansionLayer() override {
+        checkCuda(cudaFree(d_OutTensor));
+        checkCudnn(cudnnDestroyReduceTensorDescriptor(cudnnReduceDesc));
+        checkCudnn(cudnnDestroyTensorDescriptor(cudnnInTensorDesc));
+        checkCudnn(cudnnDestroyTensorDescriptor(cudnnOutTensorDesc));
+    }
+};
 
 
 
@@ -551,5 +532,4 @@ public:
 
 // Softmax (cuDNN)
 // BatchNorm (cuDNN)
-
-// Pooling / Expansion (Own Kernels)
+// Pooling
