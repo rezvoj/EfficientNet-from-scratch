@@ -10,6 +10,18 @@ struct Add {
     float operator()(const float a, const float b) const { return a + b; }
 };
 
+struct Divide {
+    __forceinline__ __device__
+    float operator()(const float a, const float b) const { return a / b; }
+};
+
+static __global__
+void floor_op(float* tensor, float floor_val, uint size) {
+    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tIdx >= size) return;
+    tensor[tIdx] = fmaxf(tensor[tIdx], floor_val);
+}
+
 template <typename Operation>
 static __global__ 
 void elementwiseOpInplace(

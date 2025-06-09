@@ -42,7 +42,6 @@ void ImageDirectoryIterator::find_image_files(const std::string& directory_path)
         if (entry.is_directory()) {
             try {
                 int label = std::stoi(entry.path().filename().string());
-                // FIX: The main typo was here. Use "::" not "-".
                 for (const auto& img_entry : fs::directory_iterator(entry.path())) {
                     if (img_entry.is_regular_file()) {
                         m_file_list.emplace_back(img_entry.path().string(), label);

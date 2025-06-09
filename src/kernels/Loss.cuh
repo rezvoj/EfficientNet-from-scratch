@@ -63,25 +63,24 @@ static __global__ void softmaxCrossEntropyFwd(
 // dLoss/dLogit_i = (Prob_i - 1) if i is the correct class
 // dLoss/dLogit_i =  Prob_i      if i is any other class
 static __global__ void softmaxCrossEntropyBwd(
-    float* __restrict__ d_logits, // Output: gradients w.r.t logits
-    const float* __restrict__ probs,    // Input: probabilities from fwd pass
-    const int* __restrict__ labels,   // Input: true labels
+    float* __restrict__ d_logits,
+    const float* __restrict__ probs,
+    const int* __restrict__ labels,
     int B, int NumClasses) {
     
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= B * NumClasses) return;
 
-    int b = i / NumClasses; // Which batch item
-    int c = i % NumClasses; // Which class logit
-
+    int b = i / NumClasses;
+    int c = i % NumClasses;
     int true_label = labels[b];
     
-    if (c == true_label) {
-        d_logits[i] = probs[i] - 1.0f;
-    } else {
-        d_logits[i] = probs[i];
-    }
+    // Convert B to float for division
+    const float invBatchSize = 1.0f / B;
 
-    // We also need to average the gradient over the batch size
-    d_logits[i] /= B;
+    if (c == true_label) {
+        d_logits[i] = (probs[i] - 1.0f) * invBatchSize;
+    } else {
+        d_logits[i] = probs[i] * invBatchSize;
+    }
 }

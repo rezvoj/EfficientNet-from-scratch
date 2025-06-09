@@ -90,17 +90,28 @@ Tensor ConvolutionLayer<FILTER_SIZE, STRIDE>::backward(const Tensor& output_grad
     gemm(output_grad_matrix, m_col_matrix_cache, m_d_weights, 1.0f, 0.0f, false, true);
 
     // 2. Compute dLoss/dX (gradient for input)
-    // This requires a "col2im" operation. We do it via another GEMM.
-    // First, calculate dY * W
     Tensor dcol(1, 1, m_in_channels * FILTER_SIZE * FILTER_SIZE, B * H_out * W_out);
     gemm(m_weights, output_grad_matrix, dcol, 1.0f, 0.0f, true, false);
 
-    // TODO: The second part is the col2im kernel, which we haven't written yet.
-    // It's the inverse of im2col. For now, we'll return a zero tensor.
+    // FIX: Perform col2im to get the final input gradient
+    // Create the final output tensor for this layer's backward pass
     Tensor input_gradient(B, m_in_channels, H_in, W_in);
+    
+    // CRITICAL: Zero out the gradient tensor before accumulating into it
     const uint threads_init = 256;
     const uint blocks_init = (input_gradient.size() + threads_init - 1) / threads_init;
     clearValue<<<blocks_init, threads_init>>>(input_gradient.data(), 0.0f, input_gradient.size());
+    CUDA_CHECK(cudaGetLastError());
+    
+    // The new kernel is launched over the elements of the dcol matrix
+    const size_t dcol_size = dcol.size();
+    const uint blocks_col2im = (dcol_size + threads_init - 1) / threads_init;
+
+    (col2imConv<FILTER_SIZE, STRIDE>)<<<blocks_col2im, threads_init>>>(
+        input_gradient.data(), dcol.data(),
+        m_in_channels, B, H_in, W_in, H_out, W_out
+    );
+    CUDA_CHECK(cudaGetLastError());
 
     return input_gradient;
 }

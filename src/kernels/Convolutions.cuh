@@ -2,7 +2,6 @@
 #include "../utils/Helpers.cuh"
 
 
-
 /**
  * @brief Creates 2nd matrix intermediate im2col representation for convolution forward pass.
  *
@@ -64,8 +63,63 @@ static __global__ void im2colConv(
     }
     tensorOut[tIdx] = pointValue;
 }
+// In src/kernels/Convolutions.cuh
 
+template <int FILTER_SIZE, int STRIDE>
+static __global__
+void col2imConv(
+        float* __restrict__ dX,         // Output: dLoss/dX, shape [B, C_in, H_in, W_in]
+        const float* __restrict__ dcol, // Input: dcol matrix, shape [C_in*F*F, B*H_out*W_out]
+        const int C_in,
+        const int B,
+        const int H_in,
+        const int W_in,
+        const int H_out,
+        const int W_out) {
 
+    // Each thread is responsible for one element in the dcol matrix.
+    // It will then "scatter" its value to the appropriate element in dX.
+    const int tIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t dcol_size = (size_t)C_in * FILTER_SIZE * FILTER_SIZE * B * H_out * W_out;
+    if (tIdx >= dcol_size) return;
+
+    // Get the value from the dcol matrix
+    const float grad_val = dcol[tIdx];
+
+    // Deconstruct the thread index to figure out which (b, c_in, fh, fw, h_out, w_out) it corresponds to.
+    constexpr int F_sq = FILTER_SIZE * FILTER_SIZE;
+    const int B_H_W_out = B * H_out * W_out;
+
+    const int dcol_row = tIdx / B_H_W_out;
+    const int dcol_col = tIdx % B_H_W_out;
+
+    const int c_in = dcol_row / F_sq;
+    const int filter_offset = dcol_row % F_sq;
+    const int fh = filter_offset / FILTER_SIZE;
+    const int fw = filter_offset % FILTER_SIZE;
+
+    const int b = dcol_col / (H_out * W_out);
+    const int out_offset = dcol_col % (H_out * W_out);
+    const int h_out = out_offset / W_out;
+    const int w_out = out_offset % W_out;
+
+    // Calculate the coordinate in the original input tensor (X) that this gradient corresponds to.
+    constexpr int PADDING = FILTER_SIZE / 2;
+    int h_in = h_out * STRIDE - PADDING + fh;
+    int w_in = w_out * STRIDE - PADDING + fw;
+    
+    // Check if the coordinate is within the bounds of the original input tensor
+    if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+        // Calculate the flat index in the output dX tensor
+        size_t dX_idx = (size_t)b * C_in * H_in * W_in +
+                        (size_t)c_in * H_in * W_in +
+                        (size_t)h_in * W_in +
+                        w_in;
+        // Atomically add the gradient value. This is crucial because multiple threads
+        // from dcol might write to the same location in dX.
+        atomicAdd(&dX[dX_idx], grad_val);
+    }
+}
 
 /**
  * @brief Creates 2nd matrix intermediate im2col representation for computing dLoss/dK.
