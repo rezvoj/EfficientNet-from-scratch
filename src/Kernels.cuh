@@ -614,38 +614,17 @@ void elementwiseActivationBackwardInplace(
 
 
 __global__ 
-void expansionForward(
+void tensorExpansion(
         float* __restrict__ outTensor,
         const float* __restrict__ inTensor,
+        const float scale,
         const uint fullSize,
         const uint outHWSize) {
     const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
     if (tIdx >= fullSize) return;
     const uint inIdx = tIdx / outHWSize;
-    outTensor[tIdx] = inTensor[inIdx];
+    outTensor[tIdx] = scale * inTensor[inIdx];
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

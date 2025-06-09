@@ -44,7 +44,7 @@ class Optimizer {
 // During training the model expects to have the memory it borrowed or same size memory
 // to get returned (traded back) by the following layer fulfilling the "Memory Contract".
 // After forward call when grad is ON, the layer is in non atomic and destroying it or
-// toggling grad would result in undefined state or crash. 
+// toggling grad would result in undefined state or crash.
 class Layer {
 protected:
     TensorSize inputSize;
@@ -457,7 +457,7 @@ public:
 
 class ExpansionLayer : public Layer {
 private:    
-    float* d_OutTensor;
+    float* d_outputTensor;
     float* d_prevTensor;
     cudnnHandle_t cudnnHandle;
     cudnnReduceTensorDescriptor_t cudnnReduceDesc;
@@ -466,8 +466,8 @@ private:
 
 public:
     ExpansionLayer(const TensorSize outputSize, const cudnnHandle_t handle):
-            Layer(outputSize, outputSize),
-            d_OutTensor(nullptr),
+            Layer({outputSize.C, 1, 1}, outputSize),
+            d_outputTensor(nullptr),
             d_prevTensor(nullptr),
             cudnnHandle(handle) {
         checkCudnn(cudnnCreateReduceTensorDescriptor(&cudnnReduceDesc));
@@ -481,11 +481,11 @@ public:
 
     void forward(float* d_borrowTensor, const size_t batchSize) override {
         d_prevTensor = d_borrowTensor;
-        const size_t fullSize = batchSize * inputSize.fullSize();
+        const size_t fullSize = batchSize * outputSize.fullSize();
         if (currBatchSize != batchSize) {
             currBatchSize = batchSize;
-            checkCuda(cudaFree(d_OutTensor));
-            checkCuda(cudaMalloc(&d_OutTensor, fullSize * sizeof(float)));
+            checkCuda(cudaFree(d_outputTensor));
+            checkCuda(cudaMalloc(&d_outputTensor, fullSize * sizeof(float)));
             checkCudnn(cudnnSetTensor4dDescriptor(
                 cudnnInTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
                 batchSize, outputSize.C, 1, 1
@@ -495,28 +495,28 @@ public:
                 batchSize, outputSize.C, outputSize.H, outputSize.W
             ));
         }
-        expansionForward<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-            d_OutTensor, d_prevTensor, fullSize, outputSize.H * outputSize.W
+        tensorExpansion<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_outputTensor, d_prevTensor, 1.0f, fullSize, outputSize.H * outputSize.W
         );
         checkCudaLastError();
-        next->forward(d_OutTensor, batchSize);
+        next->forward(d_outputTensor, batchSize);
     }
 
     void backward(float* d_replaceTensor) override {
-        d_OutTensor = d_replaceTensor;
+        d_outputTensor = d_replaceTensor;
         const float alpha = 1.0f;
         const float beta = 0.0f;
         checkCudnn(cudnnReduceTensor(
             cudnnHandle, cudnnReduceDesc,
             nullptr, 0, nullptr, 0,
-            &alpha, cudnnOutTensorDesc, d_OutTensor,
+            &alpha, cudnnOutTensorDesc, d_outputTensor,
             &beta, cudnnInTensorDesc, d_prevTensor
         ));
         prev->backward(d_prevTensor);
     }
 
     ~ExpansionLayer() override {
-        checkCuda(cudaFree(d_OutTensor));
+        checkCuda(cudaFree(d_outputTensor));
         checkCudnn(cudnnDestroyReduceTensorDescriptor(cudnnReduceDesc));
         checkCudnn(cudnnDestroyTensorDescriptor(cudnnInTensorDesc));
         checkCudnn(cudnnDestroyTensorDescriptor(cudnnOutTensorDesc));
@@ -525,11 +525,83 @@ public:
 
 
 
+class GlobalAvgPoolingLayer : public Layer {
+private:
+    float* d_outputTensor;
+    float* d_prevTensor;
+    cudnnHandle_t cudnnHandle;
+    cudnnPoolingDescriptor_t cudnnPoolingDesc;
+    cudnnTensorDescriptor_t cudnnInTensorDesc;
+    cudnnTensorDescriptor_t cudnnOutTensorDesc;
 
-// Conv2D (cuDNN)
-// Conv2DDepthwise (Own kernels)
-// Linear (own / cuBLASS)
+public:
+    GlobalAvgPoolingLayer(const TensorSize inputSize, const cudnnHandle_t handle):
+            Layer(inputSize, {inputSize.C, 1, 1}),
+            d_outputTensor(nullptr),
+            d_prevTensor(nullptr),
+            cudnnHandle(handle) {
+        checkCudnn(cudnnCreatePoolingDescriptor(&cudnnPoolingDesc));
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnInTensorDesc));
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnOutTensorDesc));
+        checkCudnn(cudnnSetPooling2dDescriptor(
+            cudnnPoolingDesc, CUDNN_POOLING_AVERAGE_COUNT_INCLUDE_PADDING,
+            CUDNN_NOT_PROPAGATE_NAN, inputSize.H, inputSize.W, 0, 0, 1, 1
+        ));
+    }
+
+    void forward(float* d_borrowTensor, const size_t batchSize) override {
+        d_prevTensor = d_borrowTensor;
+        if (currBatchSize != batchSize) {
+            currBatchSize = batchSize;
+            checkCuda(cudaFree(d_outputTensor));
+            checkCuda(cudaMalloc(&d_outputTensor, batchSize * outputSize.fullSize() * sizeof(float)));
+            checkCudnn(cudnnSetTensor4dDescriptor(
+                cudnnInTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                batchSize, inputSize.C, inputSize.H, inputSize.W
+            ));
+            checkCudnn(cudnnSetTensor4dDescriptor(
+                cudnnOutTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                batchSize, outputSize.C, 1, 1
+            ));
+        }
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        checkCudnn(cudnnPoolingForward(
+            cudnnHandle, cudnnPoolingDesc,
+            &alpha, cudnnInTensorDesc, d_prevTensor,
+            &beta, cudnnOutTensorDesc, d_outputTensor
+        ));
+        next->forward(d_outputTensor, batchSize);
+    }
+
+    void backward(float* d_replaceTensor) override {
+        d_outputTensor = d_replaceTensor;
+        const size_t fullSize = currBatchSize * inputSize.fullSize();
+        const float scale = 1.0f / static_cast<float>(inputSize.H * inputSize.W);
+        tensorExpansion<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_prevTensor, d_outputTensor, scale, fullSize, inputSize.H * inputSize.W
+        );
+        checkCudaLastError();
+        prev->backward(d_prevTensor);
+    }
+
+    ~GlobalAvgPoolingLayer() {
+        checkCuda(cudaFree(d_outputTensor));
+        checkCudnn(cudnnDestroyPoolingDescriptor(cudnnPoolingDesc));
+        checkCudnn(cudnnDestroyTensorDescriptor(cudnnInTensorDesc));
+        checkCudnn(cudnnDestroyTensorDescriptor(cudnnOutTensorDesc));
+    }
+};
+
+
+
+// [LRNABLE] BatchNorm (cuDNN)
+
+// Scholastic depth within residual?
+// Multiple next methods?
 
 // Softmax (cuDNN)
-// BatchNorm (cuDNN)
-// Pooling
+// [LRNABLE] Conv2D (cuDNN)
+
+// [LRNABLE] Conv2DDepthwise (Own kernels)
+// [LRNABLE] Linear (own / cuBLASS)
