@@ -595,13 +595,175 @@ public:
 
 
 
-// [LRNABLE] BatchNorm (cuDNN)
+class BatchNormLayer : public Layer {
+private:
+    bool backON;
+    float expAvgFactor;
+    float epsilon;
+    float* d_outputTensor;
+    float* d_backOutputTensor;
+    float* d_scale;
+    float* d_shift;
+    float* d_runningMean;
+    float* d_runningVar;
+    float* d_scaleGrads;
+    float* d_shiftGrads;
+    float* d_batchMean;
+    float* d_batchInvVariance;
+    float* d_prevTensor;
+    cudnnHandle_t cudnnHandle;
+    cudnnTensorDescriptor_t cudnnFullTensorDesc;
+    cudnnTensorDescriptor_t cudnnChannelFlatTensorDesc;
 
-// Scholastic depth within residual?
-// Multiple next methods?
+public:
+    BatchNormLayer(
+            const TensorSize inputSize,
+            const float expAvgFactor,
+            const float epsilon,
+            const cudnnHandle_t handle):
+                Layer(inputSize, inputSize),
+                backON(false),
+                expAvgFactor(expAvgFactor),
+                epsilon(epsilon),
+                d_outputTensor(nullptr),
+                d_backOutputTensor(nullptr),
+                d_scale(nullptr),
+                d_shift(nullptr),
+                d_runningMean(nullptr),
+                d_runningVar(nullptr),
+                d_scaleGrads(nullptr),
+                d_shiftGrads(nullptr),
+                d_batchMean(nullptr),
+                d_batchInvVariance(nullptr),
+                d_prevTensor(nullptr),
+                cudnnHandle(handle) {
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnFullTensorDesc));
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnChannelFlatTensorDesc));
+        checkCudnn(cudnnSetTensor4dDescriptor(
+            cudnnChannelFlatTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+            1, inputSize.C, 1, 1
+        ));
+        checkCuda(cudaMalloc(&d_scale, outputSize.C * sizeof(float)));
+        checkCuda(cudaMalloc(&d_shift, outputSize.C * sizeof(float)));
+        checkCuda(cudaMalloc(&d_runningMean, outputSize.C * sizeof(float)));
+        checkCuda(cudaMalloc(&d_runningVar, outputSize.C * sizeof(float)));
+    }
 
+    void toggleGrad(const bool gradON) override {
+        if (!backON && gradON) {
+            backON = true;
+            checkCuda(cudaMalloc(&d_backOutputTensor, currBatchSize * inputSize.fullSize() * sizeof(float)));
+            checkCuda(cudaMalloc(&d_scaleGrads, outputSize.C * sizeof(float)));
+            checkCuda(cudaMalloc(&d_shiftGrads, outputSize.C * sizeof(float)));
+            checkCuda(cudaMalloc(&d_batchMean, outputSize.C * sizeof(float)));
+            checkCuda(cudaMalloc(&d_batchInvVariance, outputSize.C * sizeof(float)));
+        }
+        else if (backON && !gradON) {
+            backON = false;
+            checkCuda(cudaFree(d_backOutputTensor));
+            checkCuda(cudaFree(d_scaleGrads));
+            checkCuda(cudaFree(d_shiftGrads));
+            checkCuda(cudaFree(d_batchMean));
+            checkCuda(cudaFree(d_batchInvVariance));
+            d_backOutputTensor = nullptr;
+            d_scaleGrads = nullptr;
+            d_shiftGrads = nullptr;
+            d_batchMean = nullptr;
+            d_batchInvVariance = nullptr;
+        }
+    };
+
+    void forward(float* d_borrowTensor, const size_t batchSize) override {
+        d_prevTensor = d_borrowTensor;
+        if (currBatchSize != batchSize) {
+            currBatchSize = batchSize;
+            checkCuda(cudaFree(d_outputTensor));
+            checkCuda(cudaMalloc(&d_outputTensor, batchSize * outputSize.fullSize() * sizeof(float)));
+            checkCudnn(cudnnSetTensor4dDescriptor(
+                cudnnFullTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                batchSize, outputSize.C, outputSize.H, outputSize.W
+            ));
+            if (backON) {
+                checkCuda(cudaFree(d_backOutputTensor));
+                checkCuda(cudaMalloc(&d_backOutputTensor, batchSize * inputSize.fullSize() * sizeof(float)));
+            }
+        }
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        if (backON) {
+            checkCudnn(cudnnBatchNormalizationForwardTraining(
+                cudnnHandle, CUDNN_BATCHNORM_SPATIAL, &alpha, &beta,
+                cudnnFullTensorDesc, d_borrowTensor,
+                cudnnFullTensorDesc, d_outputTensor,
+                cudnnChannelFlatTensorDesc,
+                d_scale, d_shift,
+                expAvgFactor, d_runningMean, d_runningVar,
+                epsilon, d_batchMean, d_batchInvVariance
+            ));
+        }
+        else {
+            checkCudnn(cudnnBatchNormalizationForwardInference(
+                cudnnHandle, CUDNN_BATCHNORM_SPATIAL, &alpha, &beta,
+                cudnnFullTensorDesc, d_borrowTensor,
+                cudnnFullTensorDesc, d_outputTensor,
+                cudnnChannelFlatTensorDesc,
+                d_scale, d_shift,
+                d_runningMean, d_runningVar,
+                epsilon
+            ));
+        }
+        next->forward(d_outputTensor, batchSize);
+    }
+
+    void backward(float* d_replaceTensor) override {
+        d_outputTensor = d_replaceTensor;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        checkCudnn(cudnnBatchNormalizationBackward(
+            cudnnHandle, CUDNN_BATCHNORM_SPATIAL,
+            &alpha, &beta, &alpha, &beta,
+            cudnnFullTensorDesc, d_prevTensor,
+            cudnnFullTensorDesc, d_outputTensor,
+            cudnnFullTensorDesc, d_backOutputTensor,
+            cudnnChannelFlatTensorDesc,
+            d_scale, d_scaleGrads, d_shiftGrads,
+            epsilon, d_batchMean, d_batchInvVariance
+        ));
+        prev->backward(d_backOutputTensor);
+        d_backOutputTensor = d_prevTensor;
+    }
+
+    ~BatchNormLayer() {
+        checkCuda(cudaFree(d_outputTensor));
+        checkCuda(cudaFree(d_backOutputTensor));
+        checkCuda(cudaFree(d_scale));
+        checkCuda(cudaFree(d_shift));
+        checkCuda(cudaFree(d_runningMean));
+        checkCuda(cudaFree(d_runningVar));
+        checkCuda(cudaFree(d_scaleGrads));
+        checkCuda(cudaFree(d_shiftGrads));
+        checkCuda(cudaFree(d_batchMean));
+        checkCuda(cudaFree(d_batchInvVariance));
+        checkCudnn(cudnnDestroyTensorDescriptor(cudnnFullTensorDesc));
+        checkCudnn(cudnnDestroyTensorDescriptor(cudnnChannelFlatTensorDesc));
+    }
+};
+
+
+
+
+// Refac:
+//  Scholastic depth self skip?
+//  Multiple next methods?
+//  differentate borrowed from owned for clarity
+
+// Optimizer and optimizer types
+// Finish batch norm
 // Softmax (cuDNN)
-// [LRNABLE] Conv2D (cuDNN)
 
+
+// [LRNABLE] Conv2D (cuDNN)
 // [LRNABLE] Conv2DDepthwise (Own kernels)
+
 // [LRNABLE] Linear (own / cuBLASS)
+// LRNABLE saving
