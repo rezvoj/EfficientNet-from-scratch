@@ -49,6 +49,21 @@ private:
         float* d_oVMomentTensor;
         const float* d_batchGradTensor;
         size_t tensorFullSize;
+
+        AdamWeightData(
+                float* d_weightTensor,
+                const float* d_batchGradTensor,
+                size_t tensorFullSize) {
+            this->d_weightTensor = d_weightTensor;
+            this->d_batchGradTensor = d_batchGradTensor;
+            this->tensorFullSize = tensorFullSize; 
+            checkCuda(cudaMalloc(&d_oMMomentTensor, tensorFullSize * sizeof(float)));
+            checkCuda(cudaMalloc(&d_oVMomentTensor, tensorFullSize * sizeof(float)));
+            initValues<<<ceilDiv(tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_oMMomentTensor, 0.0f, tensorFullSize);
+            checkCudaLastError();
+            initValues<<<ceilDiv(tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_oVMomentTensor, 0.0f, tensorFullSize);
+            checkCudaLastError();
+        }        
     };
 
 private:
@@ -81,19 +96,13 @@ public:
             OptimAlgo algorithm,
             float* d_weightTensor,
             const float* d_batchGradTensor,
-            size_t tensorFullSize) {        
+            const size_t tensorFullSize) {        
         switch (algorithm) {
-            case ADAM_W:
-                AdamWeightData layerData = {d_weightTensor, nullptr, nullptr, d_batchGradTensor, tensorFullSize};
-                checkCuda(cudaMalloc(&layerData.d_oMMomentTensor, tensorFullSize * sizeof(float)));
-                checkCuda(cudaMalloc(&layerData.d_oVMomentTensor, tensorFullSize * sizeof(float)));
-                adamWParams.push_back(layerData);
+            case ADAM:
+                adamParams.emplace_back(d_weightTensor, d_batchGradTensor, tensorFullSize);
                 break;
-            case ADAM: default:
-                AdamWeightData layerData = {d_weightTensor, nullptr, nullptr, d_batchGradTensor, tensorFullSize};
-                checkCuda(cudaMalloc(&layerData.d_oMMomentTensor, tensorFullSize * sizeof(float)));
-                checkCuda(cudaMalloc(&layerData.d_oVMomentTensor, tensorFullSize * sizeof(float)));
-                adamParams.push_back(layerData);
+            case ADAM_W: 
+                adamWParams.emplace_back(d_weightTensor, d_batchGradTensor, tensorFullSize);
                 break;
         }
     }
