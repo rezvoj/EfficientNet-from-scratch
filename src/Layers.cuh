@@ -93,7 +93,7 @@ public:
     //  invalid when layer switches to inference mode
     //  so the optimizer needs to be reset
     void registerLayer(
-            OptimAlgo algorithm,
+            const OptimAlgo algorithm,
             float* d_weightTensor,
             const float* d_batchGradTensor,
             const size_t tensorFullSize) {        
@@ -108,7 +108,35 @@ public:
     }
 
 
+    // Called after switching train to inference and back to train mode during training loop
+    //  if the internal layer's gradient tensor was reallocated during the mode switching
+    void reRegisterLayerGrads(
+            const OptimAlgo algorithm,
+            float* d_keyWeightTensor,
+            const float* d_newBatchGradTensor) {
+        switch (algorithm) {
+            case ADAM:
+                for (AdamWeightData& layerData : adamParams) {
+                    if (layerData.d_weightTensor == d_keyWeightTensor) {
+                        layerData.d_batchGradTensor = d_newBatchGradTensor;
+                        return;
+                    }
+                }
+                break;
+            case ADAM_W:
+                for (AdamWeightData& layerData : adamWParams) {
+                    if (layerData.d_weightTensor == d_keyWeightTensor) {
+                        layerData.d_batchGradTensor = d_newBatchGradTensor;
+                        return;
+                    }
+                }
+                break;
+        }
+    }
+
+
     // Updates all the registred weights using their registered alogrithm
+    // Can't be called when the layers are in inference mode
     void step(const size_t batchSize) {
         for (AdamWeightData& layerData : adamParams) {
             adamOptimizerStep<<<ceilDiv(layerData.tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
@@ -233,6 +261,10 @@ public:
     // The registered tensors CAN'T be exchanged with other layers in memory trade
     // Doesn't do anything if layer is in inference mode
     virtual void registerWeights(Optimizer& optimizer) = 0;
+
+    // Called after switching train to inference and back to train mode during training loop
+    // Doesn't do anything if layer is still in inference mode
+    virtual void reRegisterGrads(Optimizer& optimizer) = 0;
 };
 
 
@@ -1047,7 +1079,7 @@ public:
     };
 
 
-    void initWeights() {
+    void initWeights() override {
         // Initialize the scale, shift, running mean and variance to default values
         initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oScale, 1.0f, outputSize.C);
         checkCudaLastError();
@@ -1060,13 +1092,22 @@ public:
     }
 
 
-    void registerWeights(Optimizer& optimizer) {
+    void registerWeights(Optimizer& optimizer) override {
         if (backOn) {
             // Register the scale and shift perameter tensors and their corresponding gradient tensors
             optimizer.registerLayer(optimizerAlgorithm, d_oScale, d_oScaleGrads, outputSize.C);
             optimizer.registerLayer(optimizerAlgorithm, d_oShift, d_oShiftGrads, outputSize.C);
         }
     }
+
+
+    void reRegisterGrads(Optimizer& optimizer) override {
+        if (backOn) {
+            // Register the scale and shift gradient tensors as they are deleted when switching to inference
+            optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oScale, d_oScaleGrads);
+            optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oShift, d_oShiftGrads);
+        }
+    };
 
 
     void forward(float* d_inputTensor, const size_t batchSize) override {
@@ -1282,5 +1323,21 @@ public:
         checkCuda(cudaFree(d_oLossValues));
         checkCudnn(cudnnDestroyTensorDescriptor(cudnnTensorDesc));
     }
+
+};
+
+
+
+class InputLayer : public Layer {
+
+
+
+
+
+
+
+
+
+
 
 };
