@@ -1261,7 +1261,7 @@ public:
     }
 
     
-    // Does not use the backward function, handles host tensor instead
+    // Use start backward with host labels instead of backward
     void backward(float* d_gradientTensor) override {}
 
 
@@ -1329,15 +1329,49 @@ public:
 
 
 class InputLayer : public Layer {
+private:
+    float* d_oOutTensor;
+    
+public:
+    InputLayer(const TensorSize outputSize):
+            Layer(outputSize, outputSize),
+            d_oOutTensor(nullptr) {}
+
+    
+    // Use start forward with host inputs instead of forward
+    void forward(float* d_inputTensor, const size_t batchSize) override {}
+    
+
+    // Copies the host input tensor to device and starts the forward pass chain
+    void startForward(float* inputTensor, const size_t batchSize) {
+        const size_t fullSize = batchSize * outputSize.fullSize();
+        // Reallocate memory only if it's actual size is smaller
+        if (currActualBatchSize < batchSize) {
+            currActualBatchSize = batchSize;
+            checkCuda(cudaFree(d_oOutTensor));
+            checkCuda(cudaMalloc(&d_oOutTensor, fullSize * sizeof(float)));
+        }
+        // Copy the input host tensor into the layer's owned output tensor
+        checkCuda(cudaMemcpy(
+            d_oOutTensor, inputTensor, 
+            fullSize * sizeof(float),
+            cudaMemcpyHostToDevice
+        ));
+        // Lend the output tensor with the loaded host data to the next layer
+        next->forward(d_oOutTensor, batchSize);
+    }
 
 
+    void backward(float* d_gradientTensor) override {
+        // Reclaim the given back output tensor buffer to complete the memory trade
+        d_oOutTensor = d_gradientTensor;
+    };
 
 
-
-
-
-
-
-
+    ~InputLayer() {
+        if (!std::uncaught_exceptions()) {
+            checkCuda(cudaFree(d_oOutTensor));
+        }
+    }
 
 };
