@@ -48,7 +48,6 @@ private:
         float* d_oMMomentTensor;
         float* d_oVMomentTensor;
         const float* d_batchGradTensor;
-        size_t batchSize;
         size_t tensorFullSize;
     };
 
@@ -82,23 +81,16 @@ public:
             OptimAlgo algorithm,
             float* d_weightTensor,
             const float* d_batchGradTensor,
-            size_t batchSize,
             size_t tensorFullSize) {        
         switch (algorithm) {
             case ADAM_W:
-                AdamWeightData layerData = {
-                    d_weightTensor, nullptr, nullptr, d_batchGradTensor,
-                    batchSize, tensorFullSize,
-                };
+                AdamWeightData layerData = {d_weightTensor, nullptr, nullptr, d_batchGradTensor, tensorFullSize};
                 checkCuda(cudaMalloc(&layerData.d_oMMomentTensor, tensorFullSize * sizeof(float)));
                 checkCuda(cudaMalloc(&layerData.d_oVMomentTensor, tensorFullSize * sizeof(float)));
                 adamWParams.push_back(layerData);
                 break;
             case ADAM: default:
-                AdamWeightData layerData = {
-                    d_weightTensor, nullptr, nullptr, d_batchGradTensor,
-                    batchSize, tensorFullSize,
-                };
+                AdamWeightData layerData = {d_weightTensor, nullptr, nullptr, d_batchGradTensor, tensorFullSize};
                 checkCuda(cudaMalloc(&layerData.d_oMMomentTensor, tensorFullSize * sizeof(float)));
                 checkCuda(cudaMalloc(&layerData.d_oVMomentTensor, tensorFullSize * sizeof(float)));
                 adamParams.push_back(layerData);
@@ -108,13 +100,13 @@ public:
 
 
     // Updates all the registred weights using their registered alogrithm
-    void step() {
+    void step(const size_t batchSize) {
         for (AdamWeightData& layerData : adamParams) {
             adamOptimizerStep<<<ceilDiv(layerData.tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
                 layerData.d_weightTensor, layerData.d_oMMomentTensor, layerData.d_oVMomentTensor, 
                 layerData.d_batchGradTensor, static_cast<float>(iteration),
                 learningRate, beta1, beta2, epsilon,
-                layerData.batchSize, layerData.tensorFullSize
+                static_cast<float>(batchSize), layerData.tensorFullSize
             );
             checkCudaLastError();
         }
@@ -123,7 +115,7 @@ public:
                 layerData.d_weightTensor, layerData.d_oMMomentTensor, layerData.d_oVMomentTensor,
                 layerData.d_batchGradTensor, static_cast<float>(iteration),
                 learningRate, beta1, beta2, weightDecay, epsilon,
-                layerData.batchSize, layerData.tensorFullSize
+                static_cast<float>(batchSize), layerData.tensorFullSize
             );
             checkCudaLastError();
         }
@@ -225,8 +217,12 @@ public:
                 Layer(inputSize, outputSize),
                 optimizerAlgorithm(algorithm) {}
     
+    // Initializes weights to internally spcified values
+    virtual void initWeights() = 0;
+
     // Registers the layer's weight and weight gradient tensors
     // The registered tensors CAN'T be exchanged with other layers in memory trade
+    // Doesn't do anything if layer is in inference mode
     virtual void registerWeights(Optimizer& optimizer) = 0;
 };
 
@@ -319,7 +315,7 @@ public:
 
 
     void backward(float* d_gradientTensor) override {
-        // Reclaim the incoming gradient tensor from full path
+        // Reclaim the incoming gradient tensor from full path as owned copy tensor
         if (!partialBackward) {
             partialBackward = true;
             // Reclaim the incoming tensor or keep the current one based on SD skip
@@ -646,7 +642,9 @@ public:
             checkCuda(cudaFree(d_oCudnnReserveSpace));
             d_oCudnnDropoutStates = nullptr;
             d_oCudnnReserveSpace = nullptr;
-            // Reset the batch sizes to force buffer reallocations
+        }
+        // Reset the batch sizes to force buffer reallocations in forward pass
+        if (backOn != trainOn) {
             cudnnReserveSpaceSize = 0;
             currBatchSize = 0;
             currActualBatchSize = 0;
@@ -728,7 +726,9 @@ public:
             // Free the buffer only needed during training
             checkCuda(cudaFree(d_oSavedTensor));
             d_oSavedTensor = nullptr;
-            // Reset the batch sizes to force buffer reallocations
+        }
+        // Reset the batch sizes to force buffer reallocations in forward pass
+        if (backOn != trainOn) {
             currBatchSize = 0;
             currActualBatchSize = 0;
         }
@@ -815,7 +815,7 @@ public:
     void forward(float* d_inputTensor, const size_t batchSize) override {
         // Save the borrowed input tensor
         d_bPrevTensor = d_inputTensor;
-         // Conditionally change the tensor descriptors on batch size change
+        // Conditionally change the tensor descriptors on batch size change
         if (currBatchSize != batchSize) {
             currBatchSize = batchSize;
             checkCudnn(cudnnSetTensor4dDescriptor(
@@ -848,7 +848,7 @@ public:
 
     void backward(float* d_gradientTensor) override {
         const size_t fullSize = currBatchSize * inputSize.fullSize();
-         // Reclaim the incoming gradient tensor
+        // Reclaim the incoming gradient tensor as owned output tensor
         d_oOutTensor = d_gradientTensor;
         // Expand and rescale the output tensor into the input tensor
         const float scale = 1.0f / static_cast<float>(inputSize.H * inputSize.W);
@@ -932,7 +932,7 @@ public:
 
 
     void backward(float* d_gradientTensor) override {
-        // Reclaim the incoming gradient tensor
+        // Reclaim the incoming gradient tensor as owned output tensor
         d_oOutTensor = d_gradientTensor;
         // Reduce the output tensor into the input tensor
         const float alpha = 1.0f;
@@ -961,21 +961,16 @@ public:
 
 
 
-class BatchNormLayer : public Layer {
+class BatchNormLayer : public LearnableLayer {
 private:
     float expAvgFactor;
     float epsilon;
-    float* d_outputTensor;
-    float* d_backOutputTensor;
-    float* d_scale;
-    float* d_shift;
-    float* d_runningMean;
-    float* d_runningVar;
-    float* d_scaleGrads;
-    float* d_shiftGrads;
-    float* d_batchMean;
-    float* d_batchInvVariance;
-    float* d_prevTensor;
+    float *d_oOutTensor, *d_oBackOutTensor;
+    float *d_oScale, *d_oShift;
+    float *d_oRunningMean, *d_oRunningVar;
+    float *d_oScaleGrads, *d_oShiftGrads;
+    float *d_oBatchMean, *d_oBatchInvVariance;
+    float* d_bPrevTensor;
     cudnnHandle_t cudnnHandle;
     cudnnTensorDescriptor_t cudnnFullTensorDesc;
     cudnnTensorDescriptor_t cudnnChannelFlatTensorDesc;
@@ -985,135 +980,178 @@ public:
             const TensorSize inputSize,
             const float expAvgFactor,
             const float epsilon,
+            const Optimizer::OptimAlgo algorithm,
             const cudnnHandle_t handle):
-                Layer(inputSize, inputSize),
+                LearnableLayer(inputSize, inputSize, algorithm),
                 expAvgFactor(expAvgFactor),
                 epsilon(epsilon),
-                d_outputTensor(nullptr),
-                d_backOutputTensor(nullptr),
-                d_scale(nullptr),
-                d_shift(nullptr),
-                d_runningMean(nullptr),
-                d_runningVar(nullptr),
-                d_scaleGrads(nullptr),
-                d_shiftGrads(nullptr),
-                d_batchMean(nullptr),
-                d_batchInvVariance(nullptr),
-                d_prevTensor(nullptr),
+                d_oOutTensor(nullptr),
+                d_oBackOutTensor(nullptr),
+                d_oScale(nullptr), d_oShift(nullptr),
+                d_oRunningMean(nullptr), d_oRunningVar(nullptr),
+                d_oScaleGrads(nullptr), d_oShiftGrads(nullptr),
+                d_oBatchMean(nullptr), d_oBatchInvVariance(nullptr),
+                d_bPrevTensor(nullptr),
                 cudnnHandle(handle) {
         checkCudnn(cudnnCreateTensorDescriptor(&cudnnFullTensorDesc));
         checkCudnn(cudnnCreateTensorDescriptor(&cudnnChannelFlatTensorDesc));
         checkCudnn(cudnnSetTensor4dDescriptor(
-            cudnnChannelFlatTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+            cudnnChannelFlatTensorDesc, 
+            CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
             1, inputSize.C, 1, 1
         ));
-        checkCuda(cudaMalloc(&d_scale, outputSize.C * sizeof(float)));
-        checkCuda(cudaMalloc(&d_shift, outputSize.C * sizeof(float)));
-        checkCuda(cudaMalloc(&d_runningMean, outputSize.C * sizeof(float)));
-        checkCuda(cudaMalloc(&d_runningVar, outputSize.C * sizeof(float)));
+        checkCuda(cudaMalloc(&d_oScale, outputSize.C * sizeof(float)));
+        checkCuda(cudaMalloc(&d_oShift, outputSize.C * sizeof(float)));
+        checkCuda(cudaMalloc(&d_oRunningMean, outputSize.C * sizeof(float)));
+        checkCuda(cudaMalloc(&d_oRunningVar, outputSize.C * sizeof(float)));
     }
 
 
-    void toggleGrad(const bool gradON) override {
-        if (!backON && gradON) {
-            backON = true;
-            checkCuda(cudaMalloc(&d_backOutputTensor, currBatchSize * inputSize.fullSize() * sizeof(float)));
-            checkCuda(cudaMalloc(&d_scaleGrads, outputSize.C * sizeof(float)));
-            checkCuda(cudaMalloc(&d_shiftGrads, outputSize.C * sizeof(float)));
-            checkCuda(cudaMalloc(&d_batchMean, outputSize.C * sizeof(float)));
-            checkCuda(cudaMalloc(&d_batchInvVariance, outputSize.C * sizeof(float)));
+    void toggleTrain(const bool trainOn) override {
+        if (!backOn && trainOn) {
+            backOn = true;
+            // Allocate resources independant on batch size
+            checkCuda(cudaMalloc(&d_oScaleGrads, outputSize.C * sizeof(float)));
+            checkCuda(cudaMalloc(&d_oShiftGrads, outputSize.C * sizeof(float)));
+            checkCuda(cudaMalloc(&d_oBatchMean, outputSize.C * sizeof(float)));
+            checkCuda(cudaMalloc(&d_oBatchInvVariance, outputSize.C * sizeof(float)));
         }
-        else if (backON && !gradON) {
-            backON = false;
-            checkCuda(cudaFree(d_backOutputTensor));
-            checkCuda(cudaFree(d_scaleGrads));
-            checkCuda(cudaFree(d_shiftGrads));
-            checkCuda(cudaFree(d_batchMean));
-            checkCuda(cudaFree(d_batchInvVariance));
-            d_backOutputTensor = nullptr;
-            d_scaleGrads = nullptr;
-            d_shiftGrads = nullptr;
-            d_batchMean = nullptr;
-            d_batchInvVariance = nullptr;
+        else if (backOn && !trainOn) {
+            backOn = false;
+            // Free the buffers only needed during training
+            checkCuda(cudaFree(d_oBackOutTensor));
+            checkCuda(cudaFree(d_oScaleGrads));
+            checkCuda(cudaFree(d_oShiftGrads));
+            checkCuda(cudaFree(d_oBatchMean));
+            checkCuda(cudaFree(d_oBatchInvVariance));
+            d_oBackOutTensor = nullptr;
+            d_oScaleGrads = nullptr;
+            d_oShiftGrads = nullptr;
+            d_oBatchMean = nullptr;
+            d_oBatchInvVariance = nullptr;
+        }
+        // Reset the batch sizes to force buffer reallocations in forward pass
+        if (backOn != trainOn) {
+            currBatchSize = 0;
+            currActualBatchSize = 0;
         }
     };
 
 
-    void forward(float* d_borrowTensor, const size_t batchSize) override {
-        d_prevTensor = d_borrowTensor;
+    void initWeights() {
+        // Initialize the scale, shift, running mean and variance to default values
+        initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oScale, 1.0f, outputSize.C);
+        checkCudaLastError();
+        initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oShift, 0.0f, outputSize.C);
+        checkCudaLastError();
+        initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oRunningMean, 0.0f, outputSize.C);
+        checkCudaLastError();
+        initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oRunningVar, 1.0f, outputSize.C);
+        checkCudaLastError();
+    }
+
+
+    void registerWeights(Optimizer& optimizer) {
+        if (backOn) {
+            // Register the scale and shift perameter tensors and their corresponding gradient tensors
+            optimizer.registerLayer(optimizerAlgorithm, d_oScale, d_oScaleGrads, outputSize.C);
+            optimizer.registerLayer(optimizerAlgorithm, d_oShift, d_oShiftGrads, outputSize.C);
+        }
+    }
+
+
+    void forward(float* d_inputTensor, const size_t batchSize) override {
+        // Save the borrowed input tensor for backward pass
+        d_bPrevTensor = d_inputTensor;
+        // Conditionally change the tensor descriptors on batch size change
         if (currBatchSize != batchSize) {
             currBatchSize = batchSize;
-            checkCuda(cudaFree(d_outputTensor));
-            checkCuda(cudaMalloc(&d_outputTensor, batchSize * outputSize.fullSize() * sizeof(float)));
             checkCudnn(cudnnSetTensor4dDescriptor(
                 cudnnFullTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
                 batchSize, outputSize.C, outputSize.H, outputSize.W
             ));
-            if (backON) {
-                checkCuda(cudaFree(d_backOutputTensor));
-                checkCuda(cudaMalloc(&d_backOutputTensor, batchSize * inputSize.fullSize() * sizeof(float)));
+            // Reallocate memory only if it's actual size is smaller
+            if (currActualBatchSize < batchSize) {
+                currActualBatchSize = batchSize;
+                const size_t fullSizeBytes = batchSize * outputSize.fullSize() * sizeof(float);
+                checkCuda(cudaFree(d_oOutTensor));
+                checkCuda(cudaMalloc(&d_oOutTensor, fullSizeBytes));
+                // Reallocate the backprob output tensor only during training 
+                if (backOn) {
+                    checkCuda(cudaFree(d_oBackOutTensor));
+                    checkCuda(cudaMalloc(&d_oBackOutTensor, fullSizeBytes));
+                }
             }
         }
         const float alpha = 1.0f;
         const float beta = 0.0f;
-        if (backON) {
+        // Compute the forward pass activations during training using batch moments
+        if (backOn) {
             checkCudnn(cudnnBatchNormalizationForwardTraining(
                 cudnnHandle, CUDNN_BATCHNORM_SPATIAL, &alpha, &beta,
-                cudnnFullTensorDesc, d_borrowTensor,
-                cudnnFullTensorDesc, d_outputTensor,
+                cudnnFullTensorDesc, d_inputTensor,
+                cudnnFullTensorDesc, d_oOutTensor,
                 cudnnChannelFlatTensorDesc,
-                d_scale, d_shift,
-                expAvgFactor, d_runningMean, d_runningVar,
-                epsilon, d_batchMean, d_batchInvVariance
+                d_oScale, d_oShift,
+                expAvgFactor, d_oRunningMean, d_oRunningVar,
+                epsilon, d_oBatchMean, d_oBatchInvVariance
             ));
         }
+        // Compute the forward pass activations during inference using learned moments
         else {
             checkCudnn(cudnnBatchNormalizationForwardInference(
                 cudnnHandle, CUDNN_BATCHNORM_SPATIAL, &alpha, &beta,
-                cudnnFullTensorDesc, d_borrowTensor,
-                cudnnFullTensorDesc, d_outputTensor,
+                cudnnFullTensorDesc, d_inputTensor,
+                cudnnFullTensorDesc, d_oOutTensor,
                 cudnnChannelFlatTensorDesc,
-                d_scale, d_shift,
-                d_runningMean, d_runningVar,
+                d_oScale, d_oShift,
+                d_oRunningMean, d_oRunningVar,
                 epsilon
             ));
         }
-        next->forward(d_outputTensor, batchSize);
+        // Lend the output tensor with activation data to the next layer
+        next->forward(d_oOutTensor, batchSize);
     }
 
 
-    void backward(float* d_replaceTensor) override {
-        d_outputTensor = d_replaceTensor;
+    void backward(float* d_gradientTensor) override {
+        // Reclaim the incoming gradient tensor as owned output tensor
+        d_oOutTensor = d_gradientTensor;
+        // Compute the parameter gradients and input gradients
         const float alpha = 1.0f;
         const float beta = 0.0f;
         checkCudnn(cudnnBatchNormalizationBackward(
             cudnnHandle, CUDNN_BATCHNORM_SPATIAL,
             &alpha, &beta, &alpha, &beta,
-            cudnnFullTensorDesc, d_prevTensor,
-            cudnnFullTensorDesc, d_outputTensor,
-            cudnnFullTensorDesc, d_backOutputTensor,
+            cudnnFullTensorDesc, d_bPrevTensor,
+            cudnnFullTensorDesc, d_gradientTensor,
+            cudnnFullTensorDesc, d_oBackOutTensor,
             cudnnChannelFlatTensorDesc,
-            d_scale, d_scaleGrads, d_shiftGrads,
-            epsilon, d_batchMean, d_batchInvVariance
+            d_oScale, d_oScaleGrads, d_oShiftGrads,
+            epsilon, d_oBatchMean, d_oBatchInvVariance
         ));
-        prev->backward(d_backOutputTensor);
-        d_backOutputTensor = d_prevTensor;
+        // Complete memory the trade by trading the owned backward output tensor
+        //  with gradient data for saved input tensor from previous layer
+        prev->backward(d_oBackOutTensor);
+        d_oBackOutTensor = d_bPrevTensor;
     }
 
 
     ~BatchNormLayer() {
-        checkCuda(cudaFree(d_outputTensor));
-        checkCuda(cudaFree(d_backOutputTensor));
-        checkCuda(cudaFree(d_scale));
-        checkCuda(cudaFree(d_shift));
-        checkCuda(cudaFree(d_runningMean));
-        checkCuda(cudaFree(d_runningVar));
-        checkCuda(cudaFree(d_scaleGrads));
-        checkCuda(cudaFree(d_shiftGrads));
-        checkCuda(cudaFree(d_batchMean));
-        checkCuda(cudaFree(d_batchInvVariance));
-        checkCudnn(cudnnDestroyTensorDescriptor(cudnnFullTensorDesc));
-        checkCudnn(cudnnDestroyTensorDescriptor(cudnnChannelFlatTensorDesc));
+        if (!std::uncaught_exceptions()) {
+            checkCuda(cudaFree(d_oOutTensor));
+            checkCuda(cudaFree(d_oBackOutTensor));
+            checkCuda(cudaFree(d_oScale));
+            checkCuda(cudaFree(d_oShift));
+            checkCuda(cudaFree(d_oRunningMean));
+            checkCuda(cudaFree(d_oRunningVar));
+            checkCuda(cudaFree(d_oScaleGrads));
+            checkCuda(cudaFree(d_oShiftGrads));
+            checkCuda(cudaFree(d_oBatchMean));
+            checkCuda(cudaFree(d_oBatchInvVariance));
+            checkCudnn(cudnnDestroyTensorDescriptor(cudnnFullTensorDesc));
+            checkCudnn(cudnnDestroyTensorDescriptor(cudnnChannelFlatTensorDesc));
+        }
     }
 
 };

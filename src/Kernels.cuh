@@ -389,7 +389,7 @@ void initRandomValues(
     curand_init(seed, tIdx, offset, &state);
     float randVal;
     if constexpr (UseNormal) randVal = curand_normal(&state);
-    else randVal = curand_uniform(&state)* 2.0f - 1.0f;
+    else randVal = curand_uniform(&state) * 2.0f - 1.0f;
     outValues[tIdx] = randVal * range;
 }
 
