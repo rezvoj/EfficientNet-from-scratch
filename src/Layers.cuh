@@ -1,5 +1,6 @@
 #include <exception>
 #include <random>
+#include <vector>
 #include <cudnn_v9.h>
 #include "Kernels.cuh"
 #include "Utils.cuh"
@@ -33,8 +34,120 @@ struct TensorSize {
 
 
 class Optimizer {
+private:
+    size_t iteration;
+    float learningRate;
+    float beta1;
+    float beta2;
+    float weightDecay;
+    float epsilon;
+
+private:
+    struct AdamWeightData {
+        float* d_weightTensor;
+        float* d_oMMomentTensor;
+        float* d_oVMomentTensor;
+        const float* d_batchGradTensor;
+        size_t batchSize;
+        size_t tensorFullSize;
+    };
+
+private:
+    std::vector<AdamWeightData> adamParams;
+    std::vector<AdamWeightData> adamWParams;
+
+public:
+    enum OptimAlgo { ADAM, ADAM_W };
+
+public:
+    Optimizer(
+            const float learningRate,
+            const float beta1,
+            const float beta2,
+            const float weightDecay,
+            const float epsilon):
+                iteration(1), 
+                learningRate(learningRate),
+                beta1(beta1),
+                beta2(beta2),
+                weightDecay(weightDecay),
+                epsilon(epsilon) {}
 
 
+    // Registers weight tensors for layer to update
+    // The registered tensors are assumed to become
+    //  invalid when layer switches to inference mode
+    //  so the optimizer needs to be reset
+    void registerLayer(
+            OptimAlgo algorithm,
+            float* d_weightTensor,
+            const float* d_batchGradTensor,
+            size_t batchSize,
+            size_t tensorFullSize) {        
+        switch (algorithm) {
+            case ADAM_W:
+                AdamWeightData layerData = {
+                    d_weightTensor, nullptr, nullptr, d_batchGradTensor,
+                    batchSize, tensorFullSize,
+                };
+                checkCuda(cudaMalloc(&layerData.d_oMMomentTensor, tensorFullSize * sizeof(float)));
+                checkCuda(cudaMalloc(&layerData.d_oVMomentTensor, tensorFullSize * sizeof(float)));
+                adamWParams.push_back(layerData);
+                break;
+            case ADAM: default:
+                AdamWeightData layerData = {
+                    d_weightTensor, nullptr, nullptr, d_batchGradTensor,
+                    batchSize, tensorFullSize,
+                };
+                checkCuda(cudaMalloc(&layerData.d_oMMomentTensor, tensorFullSize * sizeof(float)));
+                checkCuda(cudaMalloc(&layerData.d_oVMomentTensor, tensorFullSize * sizeof(float)));
+                adamParams.push_back(layerData);
+                break;
+        }
+    }
+
+
+    // Updates all the registred weights using their registered alogrithm
+    void step() {
+        for (AdamWeightData& layerData : adamParams) {
+            adamOptimizerStep<<<ceilDiv(layerData.tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+                layerData.d_weightTensor, layerData.d_oMMomentTensor, layerData.d_oVMomentTensor, 
+                layerData.d_batchGradTensor, static_cast<float>(iteration),
+                learningRate, beta1, beta2, epsilon,
+                layerData.batchSize, layerData.tensorFullSize
+            );
+            checkCudaLastError();
+        }
+        for (AdamWeightData& layerData : adamWParams) {
+            adamWOptimizerStep<<<ceilDiv(layerData.tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+                layerData.d_weightTensor, layerData.d_oMMomentTensor, layerData.d_oVMomentTensor,
+                layerData.d_batchGradTensor, static_cast<float>(iteration),
+                learningRate, beta1, beta2, weightDecay, epsilon,
+                layerData.batchSize, layerData.tensorFullSize
+            );
+            checkCudaLastError();
+        }
+        iteration += 1;
+    }
+
+
+    // Resets the internal state back to state after construction
+    void reset() {
+        for (AdamWeightData& layerData : adamParams) {
+            checkCuda(cudaFree(layerData.d_oMMomentTensor));
+            checkCuda(cudaFree(layerData.d_oVMomentTensor));
+        }
+        for (AdamWeightData& layerData : adamWParams) {
+            checkCuda(cudaFree(layerData.d_oMMomentTensor));
+            checkCuda(cudaFree(layerData.d_oVMomentTensor));
+        }
+        adamParams.clear();
+        adamWParams.clear();
+        iteration = 1;
+    };
+
+
+    ~Optimizer() { reset(); }
 
 };
 
@@ -63,10 +176,6 @@ public:
     virtual void _setPrev(Layer* prevLayer) { prev = prevLayer; }
     virtual void _setNext(Layer* nextLayer) { next = nextLayer; }
     
-    // The layer frees the resources and buffers which it currently owns
-    // During training it can exchnage the ownership of buffers with next and previous layers
-    virtual ~Layer() {}
-    
     // Merhod to connect the layers with each other
     // Require the first layer's output size and second layer's input size to be the same
     virtual void connect(Layer* nextLayer) {
@@ -94,11 +203,31 @@ public:
     // Changes the memory buffer borrowing to memory trade contract
     // It claims the memory borrowed during forward pass from previous layer
     // Gives different piece of memory of the same size to the previous layer
-    // which contains the calculated gradient values entering the previous layer
+    //  which contains the calculated gradient values entering the previous layer
     virtual void backward(float* d_gradientTensor) = 0;
+
+    // The layer frees the resources and buffers which it currently owns
+    // During training it can exchnage the ownership of buffers with next and previous layers
+    virtual ~Layer() {}
+};
+
+
+
+class LearnableLayer : public Layer {
+protected:
+    Optimizer::OptimAlgo optimizerAlgorithm;
+
+public:
+    LearnableLayer(
+            const TensorSize inputSize,
+            const TensorSize outputSize,
+            const Optimizer::OptimAlgo algorithm):
+                Layer(inputSize, outputSize),
+                optimizerAlgorithm(algorithm) {}
     
-    // Performs a single optimizer step on the current layer escalates it onto next layer
-    virtual void optimize(const Optimizer& optimizer) { next->optimize(optimizer); }
+    // Registers the layer's weight and weight gradient tensors
+    // The registered tensors CAN'T be exchanged with other layers in memory trade
+    virtual void registerWeights(Optimizer& optimizer) = 0;
 };
 
 
@@ -108,7 +237,7 @@ private:
     bool partialBackward;
     bool stochasticSkip;
     float retainRate;
-    Layer* nextResidual;
+    Layer* nextShortcut;
     Layer* nextMerge;
     float* d_oCopyTensor;
     std::mt19937* randomGenerator;
@@ -120,7 +249,7 @@ public:
             partialBackward(false),
             stochasticSkip(false),
             retainRate(retainRate),
-            nextResidual(nullptr),
+            nextShortcut(nullptr),
             nextMerge(nullptr),
             d_oCopyTensor(nullptr),
             randomGenerator(nullptr) {
@@ -132,14 +261,14 @@ public:
     }
 
 
-    // Connect to the merge layer for skipping the non residual path
+    // Connect to the merge layer for skipping the full path
     void _setNextMerge(Layer* nextMergeLayer) { nextMerge = nextMergeLayer; }
 
 
-    // Connect the residual path's layer
-    void connectResidual(Layer* nextResidualLayer) {
-        if (nextResidual == nullptr) nextResidual = nextResidualLayer;
-        nextResidualLayer->_setPrev(this);
+    // Connect the shortcut path's layer
+    void connectShortcut(Layer* nextShortcutLayer) {
+        if (nextShortcut == nullptr) nextShortcut = nextShortcutLayer;
+        nextShortcutLayer->_setPrev(this);
     }
 
 
@@ -165,32 +294,32 @@ public:
             // Copy out the input tensor into 2 tensor for the splitting
             checkCuda(cudaMemcpy(d_oCopyTensor, d_inputTensor, fullSize * sizeof(float), cudaMemcpyDeviceToDevice));
             // Lend the both tensors to the next layers
-            // The correct the correct order (forward to residual as second) is crucial there
+            // The correct order (forward to shortcut path as second) is CRUCIAL there
             next->forward(d_oCopyTensor, batchSize);
-            nextResidual->forward(d_inputTensor, batchSize);
+            nextShortcut->forward(d_inputTensor, batchSize);
         }
         // Case for training without skip
         else if (retainRate >= 1.0f || distribution(randomGenerator) <= static_cast<double>(retainRate)) {
             // Copy out the input tensor into 2 tensor for the splitting
             checkCuda(cudaMemcpy(d_oCopyTensor, d_inputTensor, fullSize * sizeof(float), cudaMemcpyDeviceToDevice));
             // Lend the both tensors to the next layers
-            // The correct the correct order (forward to residual as second) is crucial there
+            // The correct order (forward to shortcut path as second) is CRUCIAL there
             next->forward(d_oCopyTensor, batchSize);
-            nextResidual->forward(d_inputTensor, batchSize);
+            nextShortcut->forward(d_inputTensor, batchSize);
         }
         // Case for training with skip
         else {
             // Pass nullptr as tensor to the next merge layer (signaling skip)
-            // The correct the correct order (forward to residual as second) is crucial there
+            // The correct order (forward to shortcut path as second) is CRUCIAL there
             nextMerge->forward(nullptr, batchSize);
-            // Lend the input tensor to next residual path layer
-            nextResidual->forward(d_inputTensor, batchSize);
+            // Lend the input tensor to next shortcut path layer
+            nextShortcut->forward(d_inputTensor, batchSize);
         }
     }
 
 
     void backward(float* d_gradientTensor) override {
-        // Reclaim the incoming gradient tensor from non residual connection
+        // Reclaim the incoming gradient tensor from full path
         if (!partialBackward) {
             partialBackward = true;
             // Reclaim the incoming tensor or keep the current one based on SD skip
@@ -198,7 +327,7 @@ public:
             else d_oCopyTensor = d_gradientTensor;
             return;
         }
-        // Conditionally add the gradient tensor from non residual into the residual path's tensor
+        // Conditionally add the gradient tensor from full path into the shortcut path's tensor
         if (!stochasticSkip) {
             const size_t fullSize = currBatchSize * inputSize.fullSize();
             elementwiseAddInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
@@ -209,14 +338,8 @@ public:
         // Reset the partial backward and stochastic depth skip flags
         partialBackward = false;
         stochasticSkip = false;
-        // Complete the trade by giving back the tensor with gradient data
+        // Complete memory the trade by giving back the tensor with gradient data
         prev->backward(d_gradientTensor);
-    }
-
-
-    void optimize(const Optimizer& optimizer) override {
-        next->optimize(optimizer);
-        nextResidual->optimize(optimizer);
     }
 
 
@@ -235,7 +358,7 @@ class AddMergeLayer : public Layer {
 private:
     bool partialForward;
     bool stochasticSkip;
-    Layer* prevResidual;
+    Layer* prevShortcut;
     SplitLayer* prevSplit;
     float* d_bPrevTensor;
 
@@ -244,7 +367,7 @@ public:
             Layer(inputSize, inputSize),
             partialForward(false),
             stochasticSkip(false),
-            prevResidual(nullptr),
+            prevShortcut(nullptr),
             prevSplit(nullptr),
             d_bPrevTensor(nullptr) {}
 
@@ -253,21 +376,21 @@ public:
     virtual void _setPrev(Layer* prevLayer) {}
 
 
-    // Connect the non residual incoming path
+    // Connect the full incoming path
     void setPrev(Layer* prevLayer) {
         prevLayer->_setNext(this);
         prev = prevLayer;
     }
 
 
-    // Connect the residual incoming path
-    void setPrevResidual(Layer* prevResidualLayer) {
-        prevResidualLayer->_setNext(this);
-        prevResidual = prevResidualLayer;
+    // Connect the shortcut incoming path
+    void setPrevShortcut(Layer* prevShortcutLayer) {
+        prevShortcutLayer->_setNext(this);
+        prevShortcut = prevShortcutLayer;
     }
 
 
-    // Connect the corresponding split layer to conditionally skip non residual path
+    // Connect the corresponding split layer to conditionally skip full path
     void setPrevSplit(SplitLayer* prevSplitLayer) {
         prevSplitLayer->_setNextMerge(this);
         prevSplit = prevSplitLayer;
@@ -277,7 +400,7 @@ public:
     void forward(float* d_inputTensor, const size_t batchSize) override {
         // Save the batch size for backwards pass
         currBatchSize = batchSize;
-        // Handle forward pass comming from the non residual connection
+        // Handle forward pass comming from the full path
         if (!partialForward) {
             partialForward = true;
             // Borrow the input tensor and conditionally set the SD flag
@@ -285,29 +408,28 @@ public:
             stochasticSkip = (d_inputTensor == nullptr);
             return;
         }
-        // Handle forward pass comming from the residual connection
+        // Handle forward pass comming from the shortcut path
         partialForward = false;
-        // Skip the addition and forward just the tensor from residual connection
+        // Conditionally skip the addition and forward just the tensor from shortcut path
         if (!stochasticSkip) {
-            // Add the input tensors into the non residual's input tensor
+            // Add the input tensors into the full path's input tensor
             const size_t fullSize = batchSize * inputSize.fullSize();
             elementwiseAddInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
                 d_inputTensor, d_bPrevTensor, fullSize
             );
             checkCudaLastError();
         }
-        // Lend the borrowed residual's input tensor with activation data to next layer
+        // Lend the borrowed shortcut path's tensor with activation data to next layer
         next->forward(d_inputTensor, batchSize);
     }
 
 
     void backward(float* d_gradientTensor) override {
-        // Conditionally skip backprob through the non residual path
+        // Conditionally skip backprob through the full path
         if (!stochasticSkip) {
             const size_t copySize = currBatchSize * inputSize.fullSize() * sizeof(float);
-            // Copy out the gradients for the non residual path into it's input tensor
             checkCuda(cudaMemcpy(d_bPrevTensor, d_gradientTensor, copySize, cudaMemcpyDeviceToDevice));
-            // Complete the trade by giving back the non residual's tensor with gradient data
+            // Give back the full paths's tensor with gradient data
             prev->backward(d_bPrevTensor);
         }
         // Or signal the skip for the split layer
@@ -315,9 +437,9 @@ public:
         // Reset the partial forward and stochastic skip flags
         partialForward = false;
         stochasticSkip = false;
-        // Complete the trade by giving back the residual's tensor with gradient data
-        // The correct the correct order (backward to residual as second) is crucial there
-        prevResidual->backward(d_gradientTensor);
+        // Complete the memory trade by giving back the shortcut path's tensor with gradient data
+        // The correct order (backward to shortcut path as second) is CRUCIAL there
+        prevShortcut->backward(d_gradientTensor);
     }
 
 };
@@ -328,43 +450,43 @@ class MulMergeLayer : public Layer {
 private:
     bool partialForward;
     bool stochasticSkip;
-    Layer* prevResidual;
+    Layer* prevShortcut;
     SplitLayer* prevSplit;
     float* d_oOutTensor;
     float* d_bPrevTensor;
-    float* d_bPrevResidualTensor;
+    float* d_bPrevShortcutTensor;
 
 public:
     MulMergeLayer(const TensorSize inputSize): 
             Layer(inputSize, inputSize),
             partialForward(false),
             stochasticSkip(false),
-            prevResidual(nullptr),
+            prevShortcut(nullptr),
             prevSplit(nullptr),
             d_oOutTensor(nullptr),
             d_bPrevTensor(nullptr),
-            d_bPrevResidualTensor(nullptr) {}
+            d_bPrevShortcutTensor(nullptr) {}
 
 
     // Connect to the previous layers with inverted approach instead to avoid ambiguity
     virtual void _setPrev(Layer* prevLayer) {}
 
 
-    // Connect the non residual incoming path
+    // Connect the full incoming path
     void setPrev(Layer* prevLayer) {
         prevLayer->_setNext(this);
         prev = prevLayer;
     }
 
 
-    // Connect the residual incoming path
-    void setPrevResidual(Layer* prevResidualLayer) {
-        prevResidualLayer->_setNext(this);
-        prevResidual = prevResidualLayer;
+    // Connect the shortcut incoming path
+    void setPrevShortcut(Layer* prevShortcutLayer) {
+        prevShortcutLayer->_setNext(this);
+        prevShortcut = prevShortcutLayer;
     }
 
 
-    // Connect the corresponding split layer to conditionally skip non residual path
+    // Connect the corresponding split layer to conditionally skip the full path
     void setPrevSplit(SplitLayer* prevSplitLayer) {
         prevSplitLayer->_setNextMerge(this);
         prevSplit = prevSplitLayer;
@@ -390,7 +512,7 @@ public:
         const size_t fullSize = batchSize * inputSize.fullSize();
         // Save the batch size for backwards pass
         currBatchSize = batchSize;
-        // Handle forward pass comming from the non residual connection
+        // Handle forward pass comming from the full path
         if (!partialForward) {
             partialForward = true;
             // Resize the output tensor if needed
@@ -404,25 +526,23 @@ public:
             stochasticSkip = (d_inputTensor == nullptr);
             return;
         }
-        // Handle forward pass comming from the residual connection
+        // Handle forward pass comming from the shortcut path
         partialForward = false;
-        // Borrow the input tensor as the residual path's tensor
-        d_bPrevResidualTensor = d_inputTensor;
-        // Case for inference
+        // Borrow the input tensor as the shortcut path's tensor
+        d_bPrevShortcutTensor = d_inputTensor;
+        // Case for inference with inplace multiplication into shortcut's tensor
         if (!backOn) {
-            // Multiply the input tensors into the residual's input tensor
             elementwiseMulInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-                d_bPrevResidualTensor, d_bPrevTensor, fullSize
+                d_bPrevShortcutTensor, d_bPrevTensor, fullSize
             );
             checkCudaLastError();
-            // Lend the borrowed residual's input tensor with activation data to next layer
-            next->forward(d_bPrevResidualTensor, batchSize);
+            // Lend the borrowed shortcut's input tensor with activation data to next layer
+            next->forward(d_bPrevShortcutTensor, batchSize);
         }
-        // Case for training without skip
-        else if (backOn) {   
-            // Multiply the input tensors into the output tensor
+        // Case for training without skip with multiplication into output tensor
+        else if (!stochasticSkip) {
             elementwiseMul<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-                d_oOutTensor, d_bPrevTensor, d_bPrevResidualTensor, fullSize
+                d_oOutTensor, d_bPrevTensor, d_bPrevShortcutTensor, fullSize
             );
             checkCudaLastError();
             // Lend the output tensor with activation data to next layer
@@ -430,8 +550,8 @@ public:
         }
         // Case for training without skip
         else {
-            // Lend the borrowed residual's input tensor with it's data to next layer
-            next->forward(d_bPrevResidualTensor, batchSize);
+            // Lend the borrowed shortcut's input tensor with it's data to next layer
+            next->forward(d_bPrevShortcutTensor, batchSize);
         }
     }
 
@@ -444,22 +564,22 @@ public:
             // Calculate the gradients for both paths into their input tensors
             const size_t fullSize = currBatchSize * inputSize.fullSize();
             elementwiseMulBackwardInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-                d_bPrevTensor, d_bPrevResidualTensor, d_oOutTensor, fullSize
+                d_bPrevTensor, d_bPrevShortcutTensor, d_oOutTensor, fullSize
             );
             checkCudaLastError();
-            // Complete the trade by giving back the tensors with gradient data
-            // The correct the correct order (backward to residual as second) is crucial there
+            // Complete the memory trade by giving back the tensors with gradient data
+            // The correct order (backward to shortcut path as second) is CRUCIAL there
             prev->backward(d_bPrevTensor);
-            prevResidual->backward(d_bPrevResidualTensor);
+            prevShortcut->backward(d_bPrevShortcutTensor);
         }
         // Case with skip
         else {
             // Signal the skip for the split layer
             prevSplit->backward(nullptr);
-            // Complete the trade by giving back the residual's tensor with gradient data
-            // The correct the correct order (backward to residual as second) is crucial there
-            // The borrowed residual's tensor was given to this layer instead of owned tensor
-            prevResidual->backward(d_gradientTensor);
+            // The correct order (backward to shortcut path as second) is CRUCIAL there
+            // Complete the memory trade by giving back the shortcut path's tensor with gradient data
+            //  since the borrowed shortcut path's tensor was given to this layer instead of output tensor
+            prevShortcut->backward(d_gradientTensor);
         }
         // Reset the partial forward and stochastic skip flags
         partialForward = false;
@@ -479,14 +599,13 @@ public:
 
 class DropoutLayer : public Layer {
 private:
-    bool backON;
     float dropoutRate;
     size_t dropoutSeed;
-    void* d_cudnnDropoutStates;
-    void* d_cudnnReserveSpace;
-    cudnnHandle_t cudnnHandle;
     size_t cudnnDropoutStatesSize;
     size_t cudnnReserveSpaceSize;
+    void* d_oCudnnDropoutStates;
+    void* d_oCudnnReserveSpace;
+    cudnnHandle_t cudnnHandle;
     cudnnDropoutDescriptor_t cudnnDropoutDesc;
     cudnnTensorDescriptor_t cudnnTensorDesc;
 
@@ -497,76 +616,96 @@ public:
             const size_t seed,
             const cudnnHandle_t handle): 
                 Layer(inputSize, inputSize),
-                backON(false),
                 dropoutRate(rate),
                 dropoutSeed(seed),
-                d_cudnnDropoutStates(nullptr),
-                d_cudnnReserveSpace(nullptr),
-                cudnnHandle(handle),
-                cudnnReserveSpaceSize(0) {
+                cudnnDropoutStatesSize(0),
+                cudnnReserveSpaceSize(0),
+                d_oCudnnDropoutStates(nullptr),
+                d_oCudnnReserveSpace(nullptr),
+                cudnnHandle(handle) {
         checkCudnn(cudnnCreateDropoutDescriptor(&cudnnDropoutDesc));
         checkCudnn(cudnnDropoutGetStatesSize(cudnnHandle, &cudnnDropoutStatesSize));
         checkCudnn(cudnnCreateTensorDescriptor(&cudnnTensorDesc));
     }
 
-    void toggleGrad(const bool gradON) override {
-        if (!backON && gradON) {
-            backON = true;
-            checkCuda(cudaMalloc(&d_cudnnDropoutStates, cudnnDropoutStatesSize));
+
+    void toggleTrain(const bool trainOn) override {
+        if (!backOn && trainOn) {
+            backOn = true;
+            // Recreate the dropout states the training
+            checkCuda(cudaMalloc(&d_oCudnnDropoutStates, cudnnDropoutStatesSize));
             checkCudnn(cudnnSetDropoutDescriptor(
                 cudnnDropoutDesc, cudnnHandle, dropoutRate,
-                d_cudnnDropoutStates, cudnnDropoutStatesSize, dropoutSeed
+                d_oCudnnDropoutStates, cudnnDropoutStatesSize, dropoutSeed
             ));
         }
-        else if (backON && !gradON) {
-            backON = false;
-            checkCuda(cudaFree(d_cudnnDropoutStates));
-            checkCuda(cudaFree(d_cudnnReserveSpace));
-            d_cudnnDropoutStates = nullptr;
-            d_cudnnReserveSpace = nullptr;
+        else if (backOn && !trainOn) {
+            backOn = false;
+            // Free the rosources needed only for training
+            checkCuda(cudaFree(d_oCudnnDropoutStates));
+            checkCuda(cudaFree(d_oCudnnReserveSpace));
+            d_oCudnnDropoutStates = nullptr;
+            d_oCudnnReserveSpace = nullptr;
+            // Reset the batch sizes to force buffer reallocations
             cudnnReserveSpaceSize = 0;
             currBatchSize = 0;
+            currActualBatchSize = 0;
         }
     };
 
-    void forward(float* d_borrowTensor, const size_t batchSize) override {
-        if (backON) {
+
+    void forward(float* d_inputTensor, const size_t batchSize) override {
+        if (backOn) {
+            // Conditionally change the tensor descriptor on batch size change
             if (currBatchSize != batchSize) {
                 currBatchSize = batchSize;
                 checkCudnn(cudnnSetTensor4dDescriptor(
                     cudnnTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
                     batchSize, inputSize.C, inputSize.H, inputSize.W
                 ));
-                checkCuda(cudaFree(d_cudnnReserveSpace));
-                checkCudnn(cudnnDropoutGetReserveSpaceSize(cudnnTensorDesc, &cudnnReserveSpaceSize));
-                checkCuda(cudaMalloc(&d_cudnnReserveSpace, cudnnReserveSpaceSize));
+                // Reallocate memory only if it's actual size is smaller
+                if (currActualBatchSize < batchSize) {
+                    currActualBatchSize = batchSize;
+                    checkCuda(cudaFree(d_oCudnnReserveSpace));
+                    checkCudnn(cudnnDropoutGetReserveSpaceSize(cudnnTensorDesc, &cudnnReserveSpaceSize));
+                    checkCuda(cudaMalloc(&d_oCudnnReserveSpace, cudnnReserveSpaceSize));
+                }
             }
+            // Compute the dropout forward pass inplace
             checkCudnn(cudnnDropoutForward(
                 cudnnHandle, cudnnDropoutDesc,
-                cudnnTensorDesc, d_borrowTensor,
-                cudnnTensorDesc, d_borrowTensor,   
-                d_cudnnReserveSpace, cudnnReserveSpaceSize
+                cudnnTensorDesc, d_inputTensor,
+                cudnnTensorDesc, d_inputTensor,   
+                d_oCudnnReserveSpace, cudnnReserveSpaceSize
             ));
         }
-        next->forward(d_borrowTensor, batchSize);
+        // Lend the borrowed tensor to the next layer
+        next->forward(d_inputTensor, batchSize);
     }
 
-    void backward(float* d_replaceTensor) override {
+    
+    void backward(float* d_gradientTensor) override {
+        // Calculate the backward pass on the returned tensor
         checkCudnn(cudnnDropoutBackward(
             cudnnHandle, cudnnDropoutDesc,
-            cudnnTensorDesc, d_replaceTensor,
-            cudnnTensorDesc, d_replaceTensor,   
-            d_cudnnReserveSpace, cudnnReserveSpaceSize
+            cudnnTensorDesc, d_gradientTensor,
+            cudnnTensorDesc, d_gradientTensor,
+            d_oCudnnReserveSpace, cudnnReserveSpaceSize
         ));
-        prev->backward(d_replaceTensor);
+        // Complete memory the trade by giving back the recieved tensor with gradient data
+        prev->backward(d_gradientTensor);
     }
 
+
     ~DropoutLayer() override {
-        checkCuda(cudaFree(d_cudnnDropoutStates));
-        checkCuda(cudaFree(d_cudnnReserveSpace));
-        checkCudnn(cudnnDestroyDropoutDescriptor(cudnnDropoutDesc));
-        checkCudnn(cudnnDestroyTensorDescriptor(cudnnTensorDesc));
+        if (!std::uncaught_exceptions()) {
+            checkCuda(cudaFree(d_oCudnnDropoutStates));
+            checkCuda(cudaFree(d_oCudnnReserveSpace));
+            checkCudnn(cudnnDestroyDropoutDescriptor(cudnnDropoutDesc));
+            checkCudnn(cudnnDestroyTensorDescriptor(cudnnTensorDesc));
+        }
     }
+
 };
 
 
@@ -574,145 +713,94 @@ public:
 template <typename ACTIVATION>
 class ActivationLayer : public Layer {
 private:
-    bool backON;
-    float* d_Tensor;
+    float* d_oSavedTensor;
 
 public:
     ActivationLayer(const TensorSize inputSize): 
             Layer(inputSize, inputSize),
-            backON(false),
-            d_Tensor(nullptr) {}
-    
-    void toggleGrad(const bool gradON) override {
-        if (!backON && gradON) backON = true;
-        else if (backON && !gradON) {
-            backON = false;
-            checkCuda(cudaFree(d_Tensor));
-            d_Tensor = nullptr;
+            d_oSavedTensor(nullptr) {}
+
+
+    void toggleTrain(const bool trainOn) override {
+        if (!backOn && trainOn) backOn = true;
+        else if (backOn && !trainOn) {
+            backOn = false;
+            // Free the buffer only needed during training
+            checkCuda(cudaFree(d_oSavedTensor));
+            d_oSavedTensor = nullptr;
+            // Reset the batch sizes to force buffer reallocations
             currBatchSize = 0;
+            currActualBatchSize = 0;
         }
     };
 
-    void forward(float* d_borrowTensor, const size_t batchSize) override {
+
+    void forward(float* d_inputTensor, const size_t batchSize) override {
         const size_t fullSize = batchSize * inputSize.fullSize();
-        if (backON) {
-            if (currBatchSize != batchSize) {
-                currBatchSize = batchSize;
-                checkCuda(cudaFree(d_Tensor));
-                checkCuda(cudaMalloc(&d_Tensor, fullSize * sizeof(float)));
+        // Save the batch size for backwards pass
+        currBatchSize = batchSize;
+        // Case for training
+        if (backOn) {
+            // Reallocate the buffer only if the actual size is smaller then batch size
+            if (currActualBatchSize < batchSize) {
+                currActualBatchSize = batchSize;
+                checkCuda(cudaFree(d_oSavedTensor));
+                checkCuda(cudaMalloc(&d_oSavedTensor, fullSize * sizeof(float)));
             }
+            // Calculate the activation into the saved tensor
             elementwiseActivation<ACTIVATION>
-                <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_Tensor, d_borrowTensor, fullSize); 
+                <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_oSavedTensor, d_inputTensor, fullSize); 
             checkCudaLastError();
-            std::swap(d_borrowTensor, d_Tensor);
+            // Claim the ownership of the input tensor in the place of the saved tensor
+            std::swap(d_inputTensor, d_oSavedTensor);
         }
+        // Case for inference
         else {
+            // Calculate the activation inplace, since no need to save the original input data
             elementwiseActivationInplace<ACTIVATION>
-                <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_borrowTensor, fullSize);
+                <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_inputTensor, fullSize);
             checkCudaLastError();
         }
-        next->forward(d_borrowTensor, batchSize);
+        // Lend the borrowed input tensor (or the swapped saved one) with the activation data
+        next->forward(d_inputTensor, batchSize);
     }
 
-    void backward(float* d_replaceTensor) override {
+
+    void backward(float* d_gradientTensor) override {
         const size_t fullSize = currBatchSize * inputSize.fullSize();
+        // Calculate the gradient for prev layer inplace into the tensor given back by next layer
         elementwiseActivationBackwardInplace<ACTIVATION>
-            <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_replaceTensor, d_Tensor, fullSize); 
+            <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_gradientTensor, d_oSavedTensor, fullSize); 
         checkCudaLastError();
-        prev->backward(d_replaceTensor);
+        // Complete memory the trade by giving back the recieved tensor with gradient data
+        prev->backward(d_gradientTensor);
     }
+
 
     ~ActivationLayer() override {
-        checkCuda(cudaFree(d_Tensor));
-    }
-};
-
-
-
-class ExpansionLayer : public Layer {
-private:    
-    float* d_outputTensor;
-    float* d_prevTensor;
-    cudnnHandle_t cudnnHandle;
-    cudnnReduceTensorDescriptor_t cudnnReduceDesc;
-    cudnnTensorDescriptor_t cudnnInTensorDesc;
-    cudnnTensorDescriptor_t cudnnOutTensorDesc;
-
-public:
-    ExpansionLayer(const TensorSize outputSize, const cudnnHandle_t handle):
-            Layer({outputSize.C, 1, 1}, outputSize),
-            d_outputTensor(nullptr),
-            d_prevTensor(nullptr),
-            cudnnHandle(handle) {
-        checkCudnn(cudnnCreateReduceTensorDescriptor(&cudnnReduceDesc));
-        checkCudnn(cudnnCreateTensorDescriptor(&cudnnInTensorDesc));
-        checkCudnn(cudnnCreateTensorDescriptor(&cudnnOutTensorDesc));
-        checkCudnn(cudnnSetReduceTensorDescriptor(
-            cudnnReduceDesc, CUDNN_REDUCE_TENSOR_ADD, CUDNN_DATA_FLOAT,
-            CUDNN_NOT_PROPAGATE_NAN, CUDNN_REDUCE_TENSOR_NO_INDICES, CUDNN_32BIT_INDICES
-        ));
-    }
-
-    void forward(float* d_borrowTensor, const size_t batchSize) override {
-        d_prevTensor = d_borrowTensor;
-        const size_t fullSize = batchSize * outputSize.fullSize();
-        if (currBatchSize != batchSize) {
-            currBatchSize = batchSize;
-            checkCuda(cudaFree(d_outputTensor));
-            checkCuda(cudaMalloc(&d_outputTensor, fullSize * sizeof(float)));
-            checkCudnn(cudnnSetTensor4dDescriptor(
-                cudnnInTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                batchSize, outputSize.C, 1, 1
-            ));
-            checkCudnn(cudnnSetTensor4dDescriptor(
-                cudnnOutTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
-                batchSize, outputSize.C, outputSize.H, outputSize.W
-            ));
+        if (!std::uncaught_exceptions()) {
+            checkCuda(cudaFree(d_oSavedTensor));
         }
-        tensorExpansion<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-            d_outputTensor, d_prevTensor, 1.0f, fullSize, outputSize.H * outputSize.W
-        );
-        checkCudaLastError();
-        next->forward(d_outputTensor, batchSize);
     }
 
-    void backward(float* d_replaceTensor) override {
-        d_outputTensor = d_replaceTensor;
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        checkCudnn(cudnnReduceTensor(
-            cudnnHandle, cudnnReduceDesc,
-            nullptr, 0, nullptr, 0,
-            &alpha, cudnnOutTensorDesc, d_outputTensor,
-            &beta, cudnnInTensorDesc, d_prevTensor
-        ));
-        prev->backward(d_prevTensor);
-    }
-
-    ~ExpansionLayer() override {
-        checkCuda(cudaFree(d_outputTensor));
-        checkCudnn(cudnnDestroyReduceTensorDescriptor(cudnnReduceDesc));
-        checkCudnn(cudnnDestroyTensorDescriptor(cudnnInTensorDesc));
-        checkCudnn(cudnnDestroyTensorDescriptor(cudnnOutTensorDesc));
-    }
 };
 
 
 
-class GlobalAvgPoolingLayer : public Layer {
+class AvgPoolingFlattenLayer : public Layer {
 private:
-    float* d_outputTensor;
-    float* d_prevTensor;
+    float* d_oOutTensor;
+    float* d_bPrevTensor;
     cudnnHandle_t cudnnHandle;
     cudnnPoolingDescriptor_t cudnnPoolingDesc;
     cudnnTensorDescriptor_t cudnnInTensorDesc;
     cudnnTensorDescriptor_t cudnnOutTensorDesc;
 
 public:
-    GlobalAvgPoolingLayer(const TensorSize inputSize, const cudnnHandle_t handle):
+    AvgPoolingFlattenLayer(const TensorSize inputSize, const cudnnHandle_t handle):
             Layer(inputSize, {inputSize.C, 1, 1}),
-            d_outputTensor(nullptr),
-            d_prevTensor(nullptr),
+            d_oOutTensor(nullptr),
+            d_bPrevTensor(nullptr),
             cudnnHandle(handle) {
         checkCudnn(cudnnCreatePoolingDescriptor(&cudnnPoolingDesc));
         checkCudnn(cudnnCreateTensorDescriptor(&cudnnInTensorDesc));
@@ -723,12 +811,13 @@ public:
         ));
     }
 
-    void forward(float* d_borrowTensor, const size_t batchSize) override {
-        d_prevTensor = d_borrowTensor;
+
+    void forward(float* d_inputTensor, const size_t batchSize) override {
+        // Save the borrowed input tensor
+        d_bPrevTensor = d_inputTensor;
+         // Conditionally change the tensor descriptors on batch size change
         if (currBatchSize != batchSize) {
             currBatchSize = batchSize;
-            checkCuda(cudaFree(d_outputTensor));
-            checkCuda(cudaMalloc(&d_outputTensor, batchSize * outputSize.fullSize() * sizeof(float)));
             checkCudnn(cudnnSetTensor4dDescriptor(
                 cudnnInTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
                 batchSize, inputSize.C, inputSize.H, inputSize.W
@@ -737,41 +826,143 @@ public:
                 cudnnOutTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
                 batchSize, outputSize.C, 1, 1
             ));
+            // Reallocate memory only if it's actual size is smaller
+            if (currActualBatchSize < batchSize) {
+                currActualBatchSize = batchSize;
+                checkCuda(cudaFree(d_oOutTensor));
+                checkCuda(cudaMalloc(&d_oOutTensor, batchSize * outputSize.fullSize() * sizeof(float)));
+            }
         }
+        // Flatten the input tensor into the output tensor
         const float alpha = 1.0f;
         const float beta = 0.0f;
         checkCudnn(cudnnPoolingForward(
             cudnnHandle, cudnnPoolingDesc,
-            &alpha, cudnnInTensorDesc, d_prevTensor,
-            &beta, cudnnOutTensorDesc, d_outputTensor
+            &alpha, cudnnInTensorDesc, d_bPrevTensor,
+            &beta, cudnnOutTensorDesc, d_oOutTensor
         ));
-        next->forward(d_outputTensor, batchSize);
+        // Lend the output tensor with activation data to the next layer
+        next->forward(d_oOutTensor, batchSize);
     }
 
-    void backward(float* d_replaceTensor) override {
-        d_outputTensor = d_replaceTensor;
+
+    void backward(float* d_gradientTensor) override {
         const size_t fullSize = currBatchSize * inputSize.fullSize();
+         // Reclaim the incoming gradient tensor
+        d_oOutTensor = d_gradientTensor;
+        // Expand and rescale the output tensor into the input tensor
         const float scale = 1.0f / static_cast<float>(inputSize.H * inputSize.W);
         tensorExpansion<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-            d_prevTensor, d_outputTensor, scale, fullSize, inputSize.H * inputSize.W
+            d_bPrevTensor, d_oOutTensor, scale, fullSize, inputSize.H * inputSize.W
         );
         checkCudaLastError();
-        prev->backward(d_prevTensor);
+        // Complete memory the trade by giving back the saved input tensor with gradient data
+        prev->backward(d_bPrevTensor);
     }
 
-    ~GlobalAvgPoolingLayer() {
-        checkCuda(cudaFree(d_outputTensor));
-        checkCudnn(cudnnDestroyPoolingDescriptor(cudnnPoolingDesc));
-        checkCudnn(cudnnDestroyTensorDescriptor(cudnnInTensorDesc));
-        checkCudnn(cudnnDestroyTensorDescriptor(cudnnOutTensorDesc));
+
+    ~AvgPoolingFlattenLayer() {
+        if (!std::uncaught_exceptions()) {
+            checkCuda(cudaFree(d_oOutTensor));
+            checkCudnn(cudnnDestroyPoolingDescriptor(cudnnPoolingDesc));
+            checkCudnn(cudnnDestroyTensorDescriptor(cudnnInTensorDesc));
+            checkCudnn(cudnnDestroyTensorDescriptor(cudnnOutTensorDesc));
+        }
     }
+
+};
+
+
+
+class ExpansionLayer : public Layer {
+private:    
+    float* d_oOutTensor;
+    float* d_bPrevTensor;
+    cudnnHandle_t cudnnHandle;
+    cudnnReduceTensorDescriptor_t cudnnReduceDesc;
+    cudnnTensorDescriptor_t cudnnInTensorDesc;
+    cudnnTensorDescriptor_t cudnnOutTensorDesc;
+
+public:
+    ExpansionLayer(const TensorSize outputSize, const cudnnHandle_t handle):
+            Layer({outputSize.C, 1, 1}, outputSize),
+            d_oOutTensor(nullptr),
+            d_bPrevTensor(nullptr),
+            cudnnHandle(handle) {
+        checkCudnn(cudnnCreateReduceTensorDescriptor(&cudnnReduceDesc));
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnInTensorDesc));
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnOutTensorDesc));
+        checkCudnn(cudnnSetReduceTensorDescriptor(
+            cudnnReduceDesc, CUDNN_REDUCE_TENSOR_ADD, CUDNN_DATA_FLOAT,
+            CUDNN_NOT_PROPAGATE_NAN, CUDNN_REDUCE_TENSOR_NO_INDICES, CUDNN_32BIT_INDICES
+        ));
+    }
+
+
+    void forward(float* d_inputTensor, const size_t batchSize) override {
+        const size_t fullSize = batchSize * outputSize.fullSize();
+        // Save the borrowed input tensor
+        d_bPrevTensor = d_inputTensor;
+        // Conditionally change the tensor descriptors on batch size change
+        if (currBatchSize != batchSize) {
+            currBatchSize = batchSize;
+            checkCudnn(cudnnSetTensor4dDescriptor(
+                cudnnInTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                batchSize, outputSize.C, 1, 1
+            ));
+            checkCudnn(cudnnSetTensor4dDescriptor(
+                cudnnOutTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                batchSize, outputSize.C, outputSize.H, outputSize.W
+            ));
+            // Reallocate memory only if it's actual size is smaller
+            if (currActualBatchSize < batchSize) {
+                currActualBatchSize = batchSize;
+                checkCuda(cudaFree(d_oOutTensor));
+                checkCuda(cudaMalloc(&d_oOutTensor, fullSize * sizeof(float)));
+            }
+        }
+        // Expand the input tensor into the output tensor
+        tensorExpansion<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_oOutTensor, d_bPrevTensor, 1.0f, fullSize, outputSize.H * outputSize.W
+        );
+        checkCudaLastError();
+        // Lend the output tensor with activation data to the next layer
+        next->forward(d_oOutTensor, batchSize);
+    }
+
+
+    void backward(float* d_gradientTensor) override {
+        // Reclaim the incoming gradient tensor
+        d_oOutTensor = d_gradientTensor;
+        // Reduce the output tensor into the input tensor
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        checkCudnn(cudnnReduceTensor(
+            cudnnHandle, cudnnReduceDesc,
+            nullptr, 0, nullptr, 0,
+            &alpha, cudnnOutTensorDesc, d_oOutTensor,
+            &beta, cudnnInTensorDesc, d_bPrevTensor
+        ));
+        // Complete memory the trade by giving back the saved input tensor with gradient data
+        prev->backward(d_bPrevTensor);
+    }
+
+
+    ~ExpansionLayer() override {
+        if (!std::uncaught_exceptions()) {
+            checkCudnn(cudnnDestroyReduceTensorDescriptor(cudnnReduceDesc));
+            checkCudnn(cudnnDestroyTensorDescriptor(cudnnInTensorDesc));
+            checkCudnn(cudnnDestroyTensorDescriptor(cudnnOutTensorDesc));
+            checkCuda(cudaFree(d_oOutTensor));
+        }
+    }
+
 };
 
 
 
 class BatchNormLayer : public Layer {
 private:
-    bool backON;
     float expAvgFactor;
     float epsilon;
     float* d_outputTensor;
@@ -796,7 +987,6 @@ public:
             const float epsilon,
             const cudnnHandle_t handle):
                 Layer(inputSize, inputSize),
-                backON(false),
                 expAvgFactor(expAvgFactor),
                 epsilon(epsilon),
                 d_outputTensor(nullptr),
@@ -823,6 +1013,7 @@ public:
         checkCuda(cudaMalloc(&d_runningVar, outputSize.C * sizeof(float)));
     }
 
+
     void toggleGrad(const bool gradON) override {
         if (!backON && gradON) {
             backON = true;
@@ -846,6 +1037,7 @@ public:
             d_batchInvVariance = nullptr;
         }
     };
+
 
     void forward(float* d_borrowTensor, const size_t batchSize) override {
         d_prevTensor = d_borrowTensor;
@@ -889,6 +1081,7 @@ public:
         next->forward(d_outputTensor, batchSize);
     }
 
+
     void backward(float* d_replaceTensor) override {
         d_outputTensor = d_replaceTensor;
         const float alpha = 1.0f;
@@ -907,6 +1100,7 @@ public:
         d_backOutputTensor = d_prevTensor;
     }
 
+
     ~BatchNormLayer() {
         checkCuda(cudaFree(d_outputTensor));
         checkCuda(cudaFree(d_backOutputTensor));
@@ -921,4 +1115,5 @@ public:
         checkCudnn(cudnnDestroyTensorDescriptor(cudnnFullTensorDesc));
         checkCudnn(cudnnDestroyTensorDescriptor(cudnnChannelFlatTensorDesc));
     }
+
 };
