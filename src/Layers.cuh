@@ -1,5 +1,6 @@
 #include <exception>
 #include <random>
+#include <algorithm>
 #include <vector>
 #include <cudnn_v9.h>
 #include "Kernels.cuh"
@@ -47,12 +48,12 @@ private:
         float* d_weightTensor;
         float* d_oMMomentTensor;
         float* d_oVMomentTensor;
-        const float* d_batchGradTensor;
+        float* d_batchGradTensor;
         size_t tensorFullSize;
 
         AdamWeightData(
                 float* d_weightTensor,
-                const float* d_batchGradTensor,
+                float* d_batchGradTensor,
                 size_t tensorFullSize) {
             this->d_weightTensor = d_weightTensor;
             this->d_batchGradTensor = d_batchGradTensor;
@@ -73,6 +74,11 @@ private:
 public:
     enum OptimAlgo { ADAM, ADAM_W };
 
+private:
+    static void zeroTensor(float* d_tensor, const size_t tensorFullSize) {
+        checkCuda(cudaMemset(d_tensor, 0, tensorFullSize * sizeof(float)));
+    }
+
 public:
     Optimizer(
             const float learningRate,
@@ -89,20 +95,23 @@ public:
 
 
     // Registers weight tensors for layer to update
+    // Zeroes the provided gradient accumulation tensor
     // The registered tensors are assumed to become
     //  invalid when layer switches to inference mode
     //  so the optimizer needs to be reset
     void registerLayer(
             const OptimAlgo algorithm,
             float* d_weightTensor,
-            const float* d_batchGradTensor,
+            float* d_batchGradTensor,
             const size_t tensorFullSize) {        
         switch (algorithm) {
             case ADAM:
                 adamParams.emplace_back(d_weightTensor, d_batchGradTensor, tensorFullSize);
+                zeroTensor(d_batchGradTensor, tensorFullSize);
                 break;
             case ADAM_W: 
                 adamWParams.emplace_back(d_weightTensor, d_batchGradTensor, tensorFullSize);
+                zeroTensor(d_batchGradTensor, tensorFullSize);
                 break;
         }
     }
@@ -110,15 +119,17 @@ public:
 
     // Called after switching train to inference and back to train mode during training loop
     //  if the internal layer's gradient tensor was reallocated during the mode switching
+    // Zeroes the provided gradient accumulation tensor
     void reRegisterLayerGrads(
             const OptimAlgo algorithm,
             float* d_keyWeightTensor,
-            const float* d_newBatchGradTensor) {
+            float* d_newBatchGradTensor) {
         switch (algorithm) {
             case ADAM:
                 for (AdamWeightData& layerData : adamParams) {
                     if (layerData.d_weightTensor == d_keyWeightTensor) {
                         layerData.d_batchGradTensor = d_newBatchGradTensor;
+                        zeroTensor(d_newBatchGradTensor, layerData.tensorFullSize);
                         return;
                     }
                 }
@@ -127,6 +138,7 @@ public:
                 for (AdamWeightData& layerData : adamWParams) {
                     if (layerData.d_weightTensor == d_keyWeightTensor) {
                         layerData.d_batchGradTensor = d_newBatchGradTensor;
+                        zeroTensor(d_newBatchGradTensor, layerData.tensorFullSize);
                         return;
                     }
                 }
@@ -136,6 +148,7 @@ public:
 
 
     // Updates all the registred weights using their registered alogrithm
+    // Zeroes the gradient accumulation tensors after corresponding weight update
     // Can't be called when the layers are in inference mode
     void step(const size_t batchSize) {
         for (AdamWeightData& layerData : adamParams) {
@@ -146,6 +159,7 @@ public:
                 static_cast<float>(batchSize), layerData.tensorFullSize
             );
             checkCudaLastError();
+            zeroTensor(layerData.d_batchGradTensor, layerData.tensorFullSize);
         }
         for (AdamWeightData& layerData : adamWParams) {
             adamWOptimizerStep<<<ceilDiv(layerData.tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
@@ -155,6 +169,7 @@ public:
                 static_cast<float>(batchSize), layerData.tensorFullSize
             );
             checkCudaLastError();
+            zeroTensor(layerData.d_batchGradTensor, layerData.tensorFullSize);
         }
         iteration += 1;
     }
@@ -173,7 +188,7 @@ public:
         adamParams.clear();
         adamWParams.clear();
         iteration = 1;
-    };
+    }
 
 
     ~Optimizer() { reset(); }
@@ -221,7 +236,7 @@ public:
             currBatchSize = 0;
             currActualBatchSize = 0;
         }
-    };
+    }
     
     // Performs forward pass calculation for the current layer
     // Potentially saves the borrowed tensor to non owning pointer
@@ -255,7 +270,7 @@ public:
                 optimizerAlgorithm(algorithm) {}
     
     // Initializes weights to internally spcified values
-    virtual void initWeights() = 0;
+    virtual void initWeights(const size_t seed) = 0;
 
     // Registers the layer's weight and weight gradient tensors
     // The registered tensors CAN'T be exchanged with other layers in memory trade
@@ -542,7 +557,7 @@ public:
                 d_oOutTensor = nullptr;
             }
         }
-    };
+    }
 
 
     void forward(float* d_inputTensor, const size_t batchSize) override {
@@ -690,7 +705,7 @@ public:
             currBatchSize = 0;
             currActualBatchSize = 0;
         }
-    };
+    }
 
 
     void forward(float* d_inputTensor, const size_t batchSize) override {
@@ -773,7 +788,7 @@ public:
             currBatchSize = 0;
             currActualBatchSize = 0;
         }
-    };
+    }
 
 
     void forward(float* d_inputTensor, const size_t batchSize) override {
@@ -902,7 +917,7 @@ public:
     }
 
 
-    ~AvgPoolingFlattenLayer() {
+    ~AvgPoolingFlattenLayer() override {
         if (!std::uncaught_exceptions()) {
             checkCuda(cudaFree(d_oOutTensor));
             checkCudnn(cudnnDestroyPoolingDescriptor(cudnnPoolingDesc));
@@ -1076,10 +1091,10 @@ public:
             currBatchSize = 0;
             currActualBatchSize = 0;
         }
-    };
+    }
 
 
-    void initWeights() override {
+    void initWeights([[maybe_unused]] const size_t seed) override {
         // Initialize the scale, shift, running mean and variance to default values
         initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oScale, 1.0f, outputSize.C);
         checkCudaLastError();
@@ -1094,7 +1109,6 @@ public:
 
     void registerWeights(Optimizer& optimizer) override {
         if (backOn) {
-            // Register the scale and shift perameter tensors and their corresponding gradient tensors
             optimizer.registerLayer(optimizerAlgorithm, d_oScale, d_oScaleGrads, outputSize.C);
             optimizer.registerLayer(optimizerAlgorithm, d_oShift, d_oShiftGrads, outputSize.C);
         }
@@ -1103,11 +1117,10 @@ public:
 
     void reRegisterGrads(Optimizer& optimizer) override {
         if (backOn) {
-            // Register the scale and shift gradient tensors as they are deleted when switching to inference
             optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oScale, d_oScaleGrads);
             optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oShift, d_oShiftGrads);
         }
-    };
+    }
 
 
     void forward(float* d_inputTensor, const size_t batchSize) override {
@@ -1167,12 +1180,13 @@ public:
     void backward(float* d_gradientTensor) override {
         // Reclaim the incoming gradient tensor as owned output tensor
         d_oOutTensor = d_gradientTensor;
-        // Compute the parameter gradients and input gradients
+        // Accumulate the the parameter gradients and compute input gradients
         const float alpha = 1.0f;
-        const float beta = 0.0f;
+        const float beta_overwrite = 0.0f;
+        const float beta_accumulate = 1.0f;
         checkCudnn(cudnnBatchNormalizationBackward(
             cudnnHandle, CUDNN_BATCHNORM_SPATIAL,
-            &alpha, &beta, &alpha, &beta,
+            &alpha, &beta_overwrite, &alpha, &beta_accumulate,
             cudnnFullTensorDesc, d_bPrevTensor,
             cudnnFullTensorDesc, d_gradientTensor,
             cudnnFullTensorDesc, d_oBackOutTensor,
@@ -1187,7 +1201,7 @@ public:
     }
 
 
-    ~BatchNormLayer() {
+    ~BatchNormLayer() override {
         if (!std::uncaught_exceptions()) {
             checkCuda(cudaFree(d_oOutTensor));
             checkCuda(cudaFree(d_oBackOutTensor));
@@ -1318,7 +1332,7 @@ public:
     }
 
 
-    ~SoftmaxLossLayer() {
+    ~SoftmaxLossLayer() override {
         checkCuda(cudaFree(d_oLabelValues));
         checkCuda(cudaFree(d_oLossValues));
         checkCudnn(cudnnDestroyTensorDescriptor(cudnnTensorDesc));
@@ -1365,12 +1379,302 @@ public:
     void backward(float* d_gradientTensor) override {
         // Reclaim the given back output tensor buffer to complete the memory trade
         d_oOutTensor = d_gradientTensor;
-    };
+    }
 
 
-    ~InputLayer() {
+    ~InputLayer() override {
         if (!std::uncaught_exceptions()) {
             checkCuda(cudaFree(d_oOutTensor));
+        }
+    }
+
+};
+
+
+
+class ConvolutionLayer : public LearnableLayer {
+private:
+    bool skipInputGrad;
+    size_t filterSize;
+    float* d_oOutTensor;
+    float* d_oFiltersTensor;
+    float* d_oFiltersGradTensor;
+    float* d_bPrevTensor;
+    float* d_oCudnnWorkspace;
+    size_t cudnnWorkspaceActualSize;
+    cudnnHandle_t cudnnHandle;
+    size_t cudnnWorkspaceFwdSize;
+    size_t cudnnWorkspaceBwdDataSize;
+    size_t cudnnWorkspaceBwdFilterSize;
+    cudnnConvolutionFwdAlgo_t cudnnFwdAlgo;
+    cudnnConvolutionBwdDataAlgo_t cudnnBwdDataAlgo;
+    cudnnConvolutionBwdFilterAlgo_t cudnnBwdFilterAlgo;
+    cudnnTensorDescriptor_t cudnnInTensorDesc;
+    cudnnTensorDescriptor_t cudnnOutTensorDesc;
+    cudnnFilterDescriptor_t cudnnFilterDesc;
+    cudnnConvolutionDescriptor_t cudnnConvDesc;
+
+public:
+    ConvolutionLayer(
+            const TensorSize inputSize,
+            const size_t outChannels,
+            const size_t filterSize,
+            const size_t stride,
+            const bool skipInputGrad,
+            const Optimizer::OptimAlgo algorithm,
+            const cudnnHandle_t handle):
+                LearnableLayer(inputSize, {}, algorithm),
+                skipInputGrad(skipInputGrad),
+                filterSize(filterSize),
+                d_oOutTensor(nullptr),
+                d_oFiltersTensor(nullptr),
+                d_oFiltersGradTensor(nullptr),
+                d_bPrevTensor(nullptr),
+                d_oCudnnWorkspace(nullptr),
+                cudnnWorkspaceActualSize(0),
+                cudnnHandle(handle),
+                cudnnWorkspaceFwdSize(0),
+                cudnnWorkspaceBwdDataSize(0),
+                cudnnWorkspaceBwdFilterSize(0),
+                cudnnFwdAlgo(CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM),
+                cudnnBwdDataAlgo(CUDNN_CONVOLUTION_BWD_DATA_ALGO_1),
+                cudnnBwdFilterAlgo(CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1) {
+        // Correctly calculate the output size from input size and stride
+        outputSize = {outChannels, ceilDiv(inputSize.H, stride), ceilDiv(inputSize.W, stride)};
+        // Create the cudnn tensor, filter and convolution descriptors
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnInTensorDesc));
+        checkCudnn(cudnnCreateTensorDescriptor(&cudnnOutTensorDesc));
+        checkCudnn(cudnnCreateFilterDescriptor(&cudnnFilterDesc));
+        checkCudnn(cudnnCreateConvolutionDescriptor(&cudnnConvDesc));
+        // Setup the filter and convolution cudnn descriptors 
+        checkCudnn(cudnnSetFilter4dDescriptor(
+            cudnnFilterDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+            outChannels, inputSize.C, filterSize, filterSize
+        ));
+        checkCudnn(cudnnSetConvolution2dDescriptor(cudnnConvDesc,
+            (filterSize - 1) / 2, (filterSize - 1) / 2, stride, stride, 1, 1,
+            CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT
+        ));
+        // Allocate the output tensor use by both training and inference
+        const size_t filterFullSize = outputSize.C * inputSize.C * filterSize * filterSize;
+        checkCuda(cudaMalloc(&d_oFiltersTensor, filterFullSize * sizeof(float)));
+    }
+
+
+    void initWeights(const size_t seed) override {
+        const size_t filterInSize = inputSize.C * filterSize * filterSize;
+        const size_t filterFullSize = outputSize.C * filterInSize;
+        // He-Normal initialization for the convolution filter weights
+        const float range = std::sqrt(2.0f / filterInSize);
+        initRandomValues<true><<<ceilDiv(filterFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_oFiltersTensor, seed, 0, range, filterFullSize
+        );
+        checkCudaLastError();
+    }
+
+
+    void registerWeights(Optimizer& optimizer) override {
+        if (backOn) {
+            const size_t filterFullSize = outputSize.C * inputSize.C * filterSize * filterSize;
+            optimizer.registerLayer(optimizerAlgorithm, d_oFiltersTensor, d_oFiltersGradTensor, filterFullSize);
+        }
+    }
+
+
+    void reRegisterGrads(Optimizer& optimizer) override {
+        if (backOn) {
+            optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oFiltersTensor, d_oFiltersGradTensor);
+        }
+    }
+
+
+    void toggleTrain(const bool trainOn) override {
+        if (!backOn && trainOn) {
+            backOn = true;
+            // Allocate resources independant on batch size
+            const size_t filterFullSize = outputSize.C * inputSize.C * filterSize * filterSize;
+            checkCuda(cudaMalloc(&d_oFiltersGradTensor, filterFullSize * sizeof(float)));
+        }
+        else if (backOn && !trainOn) {
+            backOn = false;
+            // Free the buffers only needed during training
+            checkCuda(cudaFree(d_oFiltersGradTensor));
+            d_oFiltersGradTensor = nullptr;
+        }
+        // Reset the batch sizes and workspace size
+        //  to force buffer reallocations in forward pass
+        if (backOn != trainOn) {
+            currBatchSize = 0;
+            currActualBatchSize = 0;
+            cudnnWorkspaceActualSize = 0;
+        }
+    }
+
+
+    void forward(float* d_inputTensor, const size_t batchSize) override {
+        // Save the borrowed input tensor for backward pass
+        d_bPrevTensor = d_inputTensor;
+        // Conditionally change the tensor sizes, convolutional algorithms 
+        //  and reallocate buffers on batch size change
+        if (currBatchSize != batchSize) {
+            currBatchSize = batchSize;
+            // Change the tensor descriptions
+            checkCudnn(cudnnSetTensor4dDescriptor(
+                cudnnInTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                batchSize, inputSize.C, inputSize.H, inputSize.W
+            ));
+            checkCudnn(cudnnSetTensor4dDescriptor(
+                cudnnOutTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                batchSize, outputSize.C, outputSize.H, outputSize.W
+            ));
+            // Reallocate buffers and rebenchmark algorithms only if the actual size is smaller
+            if (currActualBatchSize < batchSize) {
+                currActualBatchSize = batchSize;
+                // Reallocate the output tensor buffer
+                const size_t fullOutSizeBytes = batchSize * outputSize.fullSize() * sizeof(float);
+                checkCuda(cudaFree(d_oOutTensor));
+                checkCuda(cudaMalloc(&d_oOutTensor, fullOutSizeBytes));
+                // Rebenchmark the convolutional algorithms and set workspace sizes
+                int returnedAlgoCount;
+                // Benchmark the algorithm for the forward pass
+                cudnnConvolutionFwdAlgoPerf_t fwdPerfResult;
+                checkCudnn(cudnnFindConvolutionForwardAlgorithm(
+                    cudnnHandle, cudnnInTensorDesc, cudnnFilterDesc, cudnnConvDesc, cudnnOutTensorDesc,
+                    1, &returnedAlgoCount, &fwdPerfResult
+                ));
+                if (!returnedAlgoCount) {
+                    throw CudnnException("Could not find a forward conv algorithm");
+                }
+                // Set the algorithm and workspace size for forward pass
+                cudnnFwdAlgo = fwdPerfResult.algo;
+                cudnnWorkspaceFwdSize = fwdPerfResult.memory;
+                // Conditionally banchmark the backward algorithms and set workspace sizes
+                if (backOn) {
+                    if (!skipInputGrad) {
+                        // Conditionally benchmark the algorithm for the backward pass for input grad
+                        cudnnConvolutionBwdDataAlgoPerf_t bwdDataPerfResult;
+                        checkCudnn(cudnnFindConvolutionBackwardDataAlgorithm(
+                            cudnnHandle, cudnnFilterDesc, cudnnOutTensorDesc, cudnnConvDesc, cudnnInTensorDesc,
+                            1, &returnedAlgoCount, &bwdDataPerfResult
+                        ));
+                        if (!returnedAlgoCount) {
+                            throw CudnnException("Could not find a backward data conv algorithm");
+                        }
+                        // Set the algorithm and workspace size for backward pass for input grad
+                        cudnnBwdDataAlgo = bwdDataPerfResult.algo;
+                        cudnnWorkspaceBwdDataSize = bwdDataPerfResult.memory;
+                    }
+                    else {
+                        cudnnWorkspaceBwdDataSize = 0;
+                    }
+                    // Benchmark the algorithm for the backward pass for filter weights grad
+                    cudnnConvolutionBwdFilterAlgoPerf_t bwdFilterPerfResult;
+                    checkCudnn(cudnnFindConvolutionBackwardFilterAlgorithm(
+                        cudnnHandle, cudnnInTensorDesc, cudnnOutTensorDesc, cudnnConvDesc, cudnnFilterDesc,
+                        1, &returnedAlgoCount, &bwdFilterPerfResult
+                    ));
+                    if (!returnedAlgoCount) {
+                        throw CudnnException("Could not find a backward filter conv algorithm");
+                    }
+                    // Set the algorithm and workspace size for backward pass for filter weights grad
+                    cudnnBwdFilterAlgo = bwdFilterPerfResult.algo;
+                    cudnnWorkspaceBwdFilterSize = bwdFilterPerfResult.memory;
+                }
+                else {
+                    cudnnWorkspaceBwdDataSize = 0;
+                    cudnnWorkspaceBwdFilterSize = 0;
+                }
+                // Find maximal needed workspace size and reallocate if necessary
+                size_t maxWorkspaceSize = std::max({
+                    cudnnWorkspaceFwdSize,
+                    cudnnWorkspaceBwdDataSize,
+                    cudnnWorkspaceBwdFilterSize
+                });
+                if (cudnnWorkspaceActualSize < maxWorkspaceSize) {
+                    cudnnWorkspaceActualSize = maxWorkspaceSize;
+                    checkCuda(cudaFree(d_oCudnnWorkspace));
+                    checkCuda(cudaMalloc(&d_oCudnnWorkspace, cudnnWorkspaceActualSize));
+                }
+            }
+            else {
+                // Set workspace size for the forward pass with the existing algorithm
+                checkCudnn(cudnnGetConvolutionForwardWorkspaceSize(
+                    cudnnHandle, cudnnInTensorDesc, cudnnFilterDesc, cudnnConvDesc, cudnnOutTensorDesc,
+                    cudnnFwdAlgo, &cudnnWorkspaceFwdSize
+                ));
+                // Conditionally set workspace sizes for the backward passes
+                if (backOn) {
+                    // Set workspace size for the backward data pass
+                    if (!skipInputGrad) {
+                        checkCudnn(cudnnGetConvolutionBackwardDataWorkspaceSize(
+                            cudnnHandle, cudnnFilterDesc, cudnnOutTensorDesc, cudnnConvDesc, cudnnInTensorDesc,
+                            cudnnBwdDataAlgo, &cudnnWorkspaceBwdDataSize
+                        ));
+                    }
+                    else {
+                        cudnnWorkspaceBwdDataSize = 0;
+                    }
+                    // Set workspace size for the backward filter pass
+                    checkCudnn(cudnnGetConvolutionBackwardFilterWorkspaceSize(
+                        cudnnHandle, cudnnInTensorDesc, cudnnOutTensorDesc, cudnnConvDesc, cudnnFilterDesc,
+                        cudnnBwdFilterAlgo, &cudnnWorkspaceBwdFilterSize
+                    ));
+                }
+                else {
+                    cudnnWorkspaceBwdDataSize = 0;
+                    cudnnWorkspaceBwdFilterSize = 0;
+                }
+            }
+        }
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        // Compute the convolution forward pass to the owned output tensor
+        checkCudnn(cudnnConvolutionForward(
+            cudnnHandle, &alpha, cudnnInTensorDesc, d_inputTensor, cudnnFilterDesc, d_oFiltersTensor,
+            cudnnConvDesc, cudnnFwdAlgo, d_oCudnnWorkspace, cudnnWorkspaceFwdSize,
+            &beta, cudnnOutTensorDesc, d_oOutTensor
+        ));
+        // Lend the output tensor with activation data to the next layer
+        next->forward(d_oOutTensor, batchSize);
+    }
+    
+    
+    void backward(float* d_gradientTensor) override {
+        // Reclaim the incoming gradient tensor as owned output tensor
+        d_oOutTensor = d_gradientTensor;
+        // Accumulate the filter weight gradients into the owned grad tensor
+        const float alpha = 1.0f;
+        const float beta_accumulate = 1.0f;
+        checkCudnn(cudnnConvolutionBackwardFilter(
+            cudnnHandle, &alpha, cudnnInTensorDesc, d_bPrevTensor, cudnnOutTensorDesc, d_gradientTensor,
+            cudnnConvDesc, cudnnBwdFilterAlgo, d_oCudnnWorkspace, cudnnWorkspaceBwdFilterSize,
+            &beta_accumulate, cudnnFilterDesc, d_oFiltersGradTensor
+        ));
+        // Conditionally compute the input gradients into the borrowed input tensor
+        const float beta_overwrite = 0.0f;
+        if (!skipInputGrad) {
+            checkCudnn(cudnnConvolutionBackwardData(
+                cudnnHandle, &alpha, cudnnFilterDesc, d_oFiltersTensor, cudnnOutTensorDesc, d_gradientTensor,
+                cudnnConvDesc, cudnnBwdDataAlgo, d_oCudnnWorkspace, cudnnWorkspaceBwdDataSize,
+                &beta_overwrite, cudnnInTensorDesc, d_bPrevTensor
+            ));
+        }
+        // Complete memory the trade by returning the input tensor
+        //  conditionally with gradient data
+        prev->backward(d_bPrevTensor);
+    }
+
+
+    ~ConvolutionLayer() override {
+        if (!std::uncaught_exceptions()) {
+            checkCuda(cudaFree(d_oOutTensor));
+            checkCuda(cudaFree(d_oFiltersTensor));
+            checkCuda(cudaFree(d_oFiltersGradTensor));
+            checkCuda(cudaFree(d_oCudnnWorkspace));
+            checkCudnn(cudnnDestroyTensorDescriptor(cudnnInTensorDesc));
+            checkCudnn(cudnnDestroyTensorDescriptor(cudnnOutTensorDesc));
+            checkCudnn(cudnnDestroyFilterDescriptor(cudnnFilterDesc));
+            checkCudnn(cudnnDestroyConvolutionDescriptor(cudnnConvDesc));
         }
     }
 

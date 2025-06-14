@@ -1,0 +1,11 @@
+[LRNABLE] Linear (own / cuBLASS)
+
+----------------------------------------
+
+[LRNABLE] Conv2DDepthwise (Own kernels) [look again at the last one, multi variant etc.]
+LRNABLE saving
+
+----------------------------------------
+
+static_cast checks and types ...
+Smart pointers for Layers ...

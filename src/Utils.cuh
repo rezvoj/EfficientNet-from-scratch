@@ -31,6 +31,8 @@ class CudnnException : public std::runtime_error {
 public:
     CudnnException(const cudnnStatus_t status) :
         std::runtime_error(cudnnGetErrorString(status)) {}
+    CudnnException(const std::string& message) :
+        std::runtime_error(message) {}
 };
 
 

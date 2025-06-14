@@ -1,7 +1,6 @@
 env/
 .env/
 .pyenv/
-.todo.txt
 CMakeCache.txt
 CMakeFiles/
 *.cmake
