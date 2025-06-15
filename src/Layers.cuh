@@ -653,6 +653,7 @@ class DropoutLayer : public Layer {
 private:
     float dropoutRate;
     size_t dropoutSeed;
+    bool skipInputGrad;
     size_t cudnnDropoutStatesSize;
     size_t cudnnReserveSpaceSize;
     void* d_oCudnnDropoutStates;
@@ -666,10 +667,12 @@ public:
             const TensorSize inputSize,
             const float rate,
             const size_t seed,
+            const bool skipInputGrad,
             const cudnnHandle_t handle): 
                 Layer(inputSize, inputSize),
                 dropoutRate(rate),
                 dropoutSeed(seed),
+                skipInputGrad(skipInputGrad),
                 cudnnDropoutStatesSize(0),
                 cudnnReserveSpaceSize(0),
                 d_oCudnnDropoutStates(nullptr),
@@ -738,13 +741,16 @@ public:
     
     void backward(float* d_gradientTensor) override {
         // Calculate the backward pass on the returned tensor
-        checkCudnn(cudnnDropoutBackward(
-            cudnnHandle, cudnnDropoutDesc,
-            cudnnTensorDesc, d_gradientTensor,
-            cudnnTensorDesc, d_gradientTensor,
-            d_oCudnnReserveSpace, cudnnReserveSpaceSize
-        ));
-        // Complete memory the trade by giving back the recieved tensor with gradient data
+        if (!skipInputGrad) {
+            checkCudnn(cudnnDropoutBackward(
+                cudnnHandle, cudnnDropoutDesc,
+                cudnnTensorDesc, d_gradientTensor,
+                cudnnTensorDesc, d_gradientTensor,
+                d_oCudnnReserveSpace, cudnnReserveSpaceSize
+            ));
+        }
+        // Complete memory the trade by returning the input tensor
+        //  conditionally with gradient data
         prev->backward(d_gradientTensor);
     }
 
@@ -1873,10 +1879,10 @@ public:
 
 
 
-constexpr size_t FILTER_R_SIZE = 3; // template leter (this is just so IDE highlights errors properly)
-constexpr size_t STRIDE = 1; // template leter (this is just so IDE highlights errors properly)
+template <int FILTER_R_SIZE, int STRIDE>
 class DepthwiseConvolutionLayer : public LearnableLayer {
 private:
+    bool skipInputGrad;
     size_t filtersFullSize;
     float* d_oOutTensor;
     float* d_oFiltersTensor;
@@ -1884,17 +1890,20 @@ private:
     float* d_bPrevTensor;
 
 public:
-    DepthwiseConvolutionLayer(const TensorSize inputSize, const Optimizer::OptimAlgo algorithm):
-            LearnableLayer(inputSize, {}, algorithm),
-            filtersFullSize(inputSize.C * FILTER_R_SIZE * FILTER_R_SIZE),
-            d_oOutTensor(nullptr),
-            d_oFiltersTensor(nullptr),
-            d_oFiltersGradTensor(nullptr),
-            d_bPrevTensor(nullptr) {
+    DepthwiseConvolutionLayer(
+            const TensorSize inputSize,
+            const bool skipInputGrad,
+            const Optimizer::OptimAlgo algorithm):
+                LearnableLayer(inputSize, {}, algorithm),
+                skipInputGrad(skipInputGrad),
+                filtersFullSize(inputSize.C * FILTER_R_SIZE * FILTER_R_SIZE),
+                d_oOutTensor(nullptr),
+                d_oFiltersTensor(nullptr),
+                d_oFiltersGradTensor(nullptr),
+                d_bPrevTensor(nullptr) {
         // Correctly calculate the output size from input size and stride
         outputSize = {inputSize.C, ceilDiv(inputSize.H, STRIDE), ceilDiv(inputSize.W, STRIDE)};
         // Allocate the output tensor use by both training and inference
-        const size_t filtersFullSize = outputSize.C * FILTER_R_SIZE * FILTER_R_SIZE;
         checkCuda(cudaMalloc(&d_oFiltersTensor, filtersFullSize * sizeof(float)));
     }
 
@@ -1974,10 +1983,42 @@ public:
         // Lend the output tensor with activation data to the next layer
         next->forward(d_oOutTensor, batchSize);
     }
+    
+
+    void backward(float* d_gradientTensor) override {
+        // Reclaim the incoming gradient tensor as owned output tensor
+        d_oOutTensor = d_gradientTensor;
+        // Accumulate the filter weight gradients into the owned grad tensor
+        const size_t gridSize = inputSize.C * FILTER_R_SIZE * FILTER_R_SIZE;
+        depthwiseConvBackwardGrad<BLOCK_SIZE, FILTER_R_SIZE, STRIDE><<<gridSize, BLOCK_SIZE>>>(
+            d_oFiltersGradTensor, d_gradientTensor, d_bPrevTensor, currBatchSize, inputSize.C,
+            outputSize.H * outputSize.W, outputSize.W, inputSize.H, inputSize.W
+        );
+        checkCudaLastError();
+        // Conditionally compute the input gradients into the borrowed input tensor
+        if (!skipInputGrad) {
+            const dim3 blockSize(BLOCK_X_SIZE, BLOCK_Y_SIZE);
+            const size_t inHBlocks = ceilDiv(inputSize.H, BLOCK_Y_SIZE);
+            const dim3 gridSize(ceilDiv(inputSize.W, BLOCK_X_SIZE), currBatchSize * inputSize.C * inHBlocks);
+            depthwiseConvBackward<BLOCK_X_SIZE, BLOCK_Y_SIZE, FILTER_R_SIZE, STRIDE><<<gridSize, blockSize>>>(
+                d_bPrevTensor, d_gradientTensor, d_oFiltersTensor,
+                inputSize.C, inputSize.H, inputSize.W, inHBlocks,
+                outputSize.H, outputSize.W
+            );
+            checkCudaLastError();
+        }
+        // Complete memory the trade by returning the input tensor
+        //  conditionally with gradient data
+        prev->backward(d_bPrevTensor);
+    }
 
 
-
-
-
+    ~DepthwiseConvolutionLayer() override {
+        if (!std::uncaught_exceptions()) {
+            checkCuda(cudaFree(d_oOutTensor));
+            checkCuda(cudaFree(d_oFiltersTensor));
+            checkCuda(cudaFree(d_oFiltersGradTensor));
+        }
+    }
 
 };
