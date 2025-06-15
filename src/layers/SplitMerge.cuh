@@ -1,13 +1,12 @@
 #pragma once
 #include <exception>
 #include <random>
-#include <memory>
 #include "Layer.cuh"
 #include "../kernels/Elementwise.cuh"
 #include "../utils/Exceptions.cuh"
 #include "../utils/Math.cuh"
 
-constexpr size_t BLOCK_SIZE = 256;
+constexpr uint BLOCK_SIZE = 256;
 
 
 
@@ -19,14 +18,14 @@ private:
     Layer* nextShortcut;
     Layer* nextMerge;
     float* d_oCopyTensor;
-    std::unique_ptr<std::mt19937> randomGenerator;
+    std::mt19937* randomGenerator;
     std::uniform_real_distribution<> distribution;
 
 public:
     SplitLayer(
             const TensorSize inputSize,
             const float retainRate,
-            const size_t seed):
+            const uint seed):
                 Layer(inputSize, inputSize),
                 partialBackward(false),
                 stochasticSkip(false),
@@ -36,7 +35,7 @@ public:
                 d_oCopyTensor(nullptr),
                 randomGenerator(nullptr) {
         if (retainRate < 1.0f) {
-            randomGenerator = std::make_unique<std::mt19937>(seed);
+            randomGenerator = new std::mt19937(seed);
             distribution = std::uniform_real_distribution<>(0.0, 1.0);
         }
     }
@@ -53,8 +52,8 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
-        const size_t fullSize = batchSize * inputSize.fullSize();
+    void forward(float* d_inputTensor, const uint batchSize) override {
+        const uint fullSize = batchSize * inputSize.fullSize();
         // Save the batch size for backwards pass
         currBatchSize = batchSize;
         // Reallocate the buffers if batch size was changed
@@ -110,7 +109,7 @@ public:
         }
         // Conditionally add the gradient tensor from full path into the shortcut path's tensor
         if (!stochasticSkip) {
-            const size_t fullSize = currBatchSize * inputSize.fullSize();
+            const uint fullSize = currBatchSize * inputSize.fullSize();
             elementwiseAddInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
                 d_gradientTensor, d_oCopyTensor, fullSize
             );
@@ -126,6 +125,7 @@ public:
 
     ~SplitLayer() override {
         if (!std::uncaught_exceptions()) {
+            delete randomGenerator;
             checkCuda(cudaFree(d_oCopyTensor));
         }
     }
@@ -152,32 +152,28 @@ public:
             d_bPrevTensor(nullptr) {}
 
 
-    // Connect to the previous layers with inverted approach instead to avoid ambiguity
-    virtual void _setPrev(Layer* prevLayer) {}
+    // Normally connected layer is the shortcut path layer
+    void _setPrev(Layer* prevShortcutLayer) override {
+        prevShortcut = prevShortcutLayer;
+    }
 
 
-    // Connect the full incoming path
-    void setPrev(Layer* prevLayer) {
+    // Connect to the full layers with inverted approach instead to avoid ambiguity
+    void setPrevFull(Layer* prevLayer) {
         prevLayer->_setNext(this);
         prev = prevLayer;
     }
 
 
-    // Connect the shortcut incoming path
-    void setPrevShortcut(Layer* prevShortcutLayer) {
-        prevShortcutLayer->_setNext(this);
-        prevShortcut = prevShortcutLayer;
-    }
-
-
-    // Connect the corresponding split layer to conditionally skip full path
+    // Connect the corresponding split layer with inverted approach 
+    //  to conditionally skip full path
     void setPrevSplit(SplitLayer* prevSplitLayer) {
         prevSplitLayer->_setNextMerge(this);
         prevSplit = prevSplitLayer;
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
+    void forward(float* d_inputTensor, const uint batchSize) override {
         // Save the batch size for backwards pass
         currBatchSize = batchSize;
         // Handle forward pass comming from the full path
@@ -193,7 +189,7 @@ public:
         // Conditionally skip the addition and forward just the tensor from shortcut path
         if (!stochasticSkip) {
             // Add the input tensors into the full path's input tensor
-            const size_t fullSize = batchSize * inputSize.fullSize();
+            const uint fullSize = batchSize * inputSize.fullSize();
             elementwiseAddInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
                 d_inputTensor, d_bPrevTensor, fullSize
             );
@@ -207,7 +203,7 @@ public:
     void backward(float* d_gradientTensor) override {
         // Conditionally skip backprob through the full path
         if (!stochasticSkip) {
-            const size_t copySize = currBatchSize * inputSize.fullSize() * sizeof(float);
+            const uint copySize = currBatchSize * inputSize.fullSize() * sizeof(float);
             checkCuda(cudaMemcpy(d_bPrevTensor, d_gradientTensor, copySize, cudaMemcpyDeviceToDevice));
             // Give back the full paths's tensor with gradient data
             prev->backward(d_bPrevTensor);
@@ -247,26 +243,22 @@ public:
             d_bPrevTensor(nullptr),
             d_bPrevShortcutTensor(nullptr) {}
 
+    
+    // Normally connected layer is the shortcut path layer
+    void _setPrev(Layer* prevShortcutLayer) override {
+        prevShortcut = prevShortcutLayer;
+    }
 
-    // Connect to the previous layers with inverted approach instead to avoid ambiguity
-    virtual void _setPrev(Layer* prevLayer) {}
 
-
-    // Connect the full incoming path
-    void setPrev(Layer* prevLayer) {
+    // Connect to the full layers with inverted approach instead to avoid ambiguity
+    void setPrevFull(Layer* prevLayer) {
         prevLayer->_setNext(this);
         prev = prevLayer;
     }
 
 
-    // Connect the shortcut incoming path
-    void setPrevShortcut(Layer* prevShortcutLayer) {
-        prevShortcutLayer->_setNext(this);
-        prevShortcut = prevShortcutLayer;
-    }
-
-
-    // Connect the corresponding split layer to conditionally skip the full path
+    // Connect the corresponding split layer with inverted approach 
+    //  to conditionally skip full path
     void setPrevSplit(SplitLayer* prevSplitLayer) {
         prevSplitLayer->_setNextMerge(this);
         prevSplit = prevSplitLayer;
@@ -287,8 +279,8 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
-        const size_t fullSize = batchSize * inputSize.fullSize();
+    void forward(float* d_inputTensor, const uint batchSize) override {
+        const uint fullSize = batchSize * inputSize.fullSize();
         // Save the batch size for backwards pass
         currBatchSize = batchSize;
         // Handle forward pass comming from the full path
@@ -341,7 +333,7 @@ public:
             // Reclaim the incoming gradient tensor as owned output tensor
             d_oOutTensor = d_gradientTensor;
             // Calculate the gradients for both paths into their input tensors
-            const size_t fullSize = currBatchSize * inputSize.fullSize();
+            const uint fullSize = currBatchSize * inputSize.fullSize();
             elementwiseMulBackwardInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
                 d_bPrevTensor, d_bPrevShortcutTensor, d_oOutTensor, fullSize
             );

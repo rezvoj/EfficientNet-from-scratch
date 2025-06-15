@@ -5,16 +5,16 @@
 #include "../utils/Exceptions.cuh"
 #include "../utils/Math.cuh"
 
-constexpr size_t BLOCK_SIZE = 256;
+constexpr uint BLOCK_SIZE = 256;
 
 
 
 struct TensorSize {
-    size_t C = 1;
-    size_t H = 1;
-    size_t W = 1;
+    uint C = 1;
+    uint H = 1;
+    uint W = 1;
     
-    size_t fullSize() const {
+    uint fullSize() const {
         return C * H * W;
     }
 
@@ -33,7 +33,7 @@ struct TensorSize {
 
 class Optimizer {
 private:
-    size_t iteration;
+    uint iteration;
     float learningRate;
     float beta1;
     float beta2;
@@ -46,12 +46,12 @@ private:
         float* d_oMMomentTensor;
         float* d_oVMomentTensor;
         float* d_batchGradTensor;
-        size_t tensorFullSize;
+        uint tensorFullSize;
 
         AdamWeightData(
                 float* d_weightTensor,
                 float* d_batchGradTensor,
-                size_t tensorFullSize) {
+                uint tensorFullSize) {
             this->d_weightTensor = d_weightTensor;
             this->d_batchGradTensor = d_batchGradTensor;
             this->tensorFullSize = tensorFullSize; 
@@ -73,7 +73,7 @@ public:
     enum OptimAlgo { ADAM, ADAM_W };
 
 private:
-    static void zeroTensor(float* d_tensor, const size_t tensorFullSize) {
+    static void zeroTensor(float* d_tensor, const uint tensorFullSize) {
         checkCuda(cudaMemset(d_tensor, 0, tensorFullSize * sizeof(float)));
     }
 
@@ -101,7 +101,7 @@ public:
             const OptimAlgo algorithm,
             float* d_weightTensor,
             float* d_batchGradTensor,
-            const size_t tensorFullSize) {        
+            const uint tensorFullSize) {        
         switch (algorithm) {
             case ADAM:
                 adamParams.push_back(AdamWeightData(d_weightTensor, d_batchGradTensor, tensorFullSize));
@@ -148,7 +148,7 @@ public:
     // Updates all the registred weights using their registered alogrithm
     // Zeroes the gradient accumulation tensors after corresponding weight update
     // Can't be called when the layers are in inference mode
-    void step(const size_t batchSize) {
+    void step(const uint batchSize) {
         for (AdamWeightData& layerData : adamParams) {
             adamOptimizerStep<<<ceilDiv(layerData.tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
                 layerData.d_weightTensor, layerData.d_oMMomentTensor, layerData.d_oVMomentTensor, 

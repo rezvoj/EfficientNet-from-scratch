@@ -6,7 +6,7 @@
 #include "../utils/Exceptions.cuh"
 #include "../utils/Math.cuh"
 
-constexpr size_t BLOCK_SIZE = 256;
+constexpr uint BLOCK_SIZE = 256;
 
 
 
@@ -35,8 +35,8 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
-        const size_t fullSize = batchSize * inputSize.fullSize();
+    void forward(float* d_inputTensor, const uint batchSize) override {
+        const uint fullSize = batchSize * inputSize.fullSize();
         // Save the batch size for backwards pass
         currBatchSize = batchSize;
         // Case for training
@@ -67,7 +67,7 @@ public:
 
 
     void backward(float* d_gradientTensor) override {
-        const size_t fullSize = currBatchSize * inputSize.fullSize();
+        const uint fullSize = currBatchSize * inputSize.fullSize();
         // Calculate the gradient for prev layer inplace into the tensor given back by next layer
         elementwiseActivationBackwardInplace<ACTIVATION>
             <<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_gradientTensor, d_oSavedTensor, fullSize); 

@@ -38,10 +38,10 @@ void depthwiseConvForward(
     __shared__ float shFilter[FILTER_FULL_SIZE];
     __shared__ float shTile[TILE_FULL_SIZE];
     // Calculate W and flat B * C * H out index
-    const int outWIdx = blockIdx.x * BLOCK_X_SIZE + threadIdx.x;
-    const int outBCHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
+    const int outWIdx = static_cast<int>(blockIdx.x) * BLOCK_X_SIZE + static_cast<int>(threadIdx.x);
+    const int outBCHIdx = static_cast<int>(blockIdx.y) * BLOCK_Y_SIZE + static_cast<int>(threadIdx.y);
     // Calculate flat within block index
-    const int tInBlockIdx = threadIdx.y * BLOCK_X_SIZE + threadIdx.x;
+    const int tInBlockIdx = static_cast<int>(threadIdx.y) * BLOCK_X_SIZE + static_cast<int>(threadIdx.x);
     // Calculate helper divisor constants
     const int outHBlockSize = outHBlocks * BLOCK_Y_SIZE;
     const int outCHBlockSize = CSize * outHBlockSize;
@@ -55,8 +55,8 @@ void depthwiseConvForward(
         shFilter[loadIdx] = filtersTensor[CIdx * FILTER_FULL_SIZE + loadIdx];
     }
     // Calculate in padding offset W and H start indexes for the block
-    const int inWStartOffsetIdx = blockIdx.x * BLOCK_X_SIZE * STRIDE - FILTER_PADD_SIZE;
-    const int inHStartOffsetIdx = blockIdx.y % outHBlocks * BLOCK_Y_SIZE * STRIDE - FILTER_PADD_SIZE;
+    const int inWStartOffsetIdx = static_cast<int>(blockIdx.x) * BLOCK_X_SIZE * STRIDE - FILTER_PADD_SIZE;
+    const int inHStartOffsetIdx = static_cast<int>(blockIdx.y) % outHBlocks * BLOCK_Y_SIZE * STRIDE - FILTER_PADD_SIZE;
     // Calculate in B * C flat index part for input indexes
     const int BCIdx = BIdx * CSize + CIdx;
     const int inBCIdxPart = BCIdx * inHSize * inWSize;
@@ -79,8 +79,8 @@ void depthwiseConvForward(
     // Check bounds for the calculated indexes after loading data
     if (outHIdx >= outHSize || outWIdx >= outWSize) return;
     // Calculate top left Y and X convolution indexes within the block
-    const int tileYIdx = threadIdx.y * STRIDE;
-    const int tileXIdx = threadIdx.x * STRIDE;
+    const int tileYIdx = static_cast<int>(threadIdx.y) * STRIDE;
+    const int tileXIdx = static_cast<int>(threadIdx.x) * STRIDE;
     // Compute convolution on the filter and region
     float convolutionSum = 0.0f;
     for (int filterYIdx = 0; filterYIdx < FILTER_SIZE; ++filterYIdx) {
@@ -138,10 +138,10 @@ void depthwiseConvBackward(
     __shared__ float shFilter[FILTER_FULL_SIZE];
     __shared__ float shTile[TILE_FULL_SIZE];
     // Calculate W and flat B * C * H in index
-    const int inWIdx = blockIdx.x * BLOCK_X_SIZE + threadIdx.x;
-    const int inBCHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
+    const int inWIdx = static_cast<int>(blockIdx.x) * BLOCK_X_SIZE + static_cast<int>(threadIdx.x);
+    const int inBCHIdx = static_cast<int>(blockIdx.y) * BLOCK_Y_SIZE + static_cast<int>(threadIdx.y);
     // Calculate flat within block index
-    const int tInBlockIdx = threadIdx.y * BLOCK_X_SIZE + threadIdx.x;
+    const int tInBlockIdx = static_cast<int>(threadIdx.y) * BLOCK_X_SIZE + static_cast<int>(threadIdx.x);
     // Calculate helper divisor constants
     const int inHBlockSize = inHBlocks * BLOCK_Y_SIZE;
     const int inCHBlockSize = CSize * inHBlockSize;
@@ -212,7 +212,7 @@ void depthwiseConvBackward(
 
 __forceinline__ __device__ 
 float warpReduceSum(float threadValue) {
-    for (int offset = 16; offset > 0; offset /= 2) {
+    for (uint offset = 16; offset > 0; offset /= 2) {
         threadValue += __shfl_down_sync(0xFFFFFFFF, threadValue, offset);
     }
     return threadValue; 

@@ -10,17 +10,17 @@
 #include "../utils/Exceptions.cuh"
 #include "../utils/Math.cuh"
 
-constexpr size_t BLOCK_SIZE = 256;
-constexpr size_t BLOCK_X_SIZE = 16;
-constexpr size_t BLOCK_Y_SIZE = 16;
+constexpr uint BLOCK_SIZE = 256;
+constexpr uint BLOCK_X_SIZE = 16;
+constexpr uint BLOCK_Y_SIZE = 16;
 
 
 
 class ConvolutionLayer : public LearnableLayer {
 private:
     bool skipInputGrad;
-    size_t filterSize;
-    size_t filtersFullSize;
+    uint filterSize;
+    uint filtersFullSize;
     float* d_oOutTensor;
     float* d_oFiltersTensor;
     float* d_oFiltersGradTensor;
@@ -42,9 +42,9 @@ private:
 public:
     ConvolutionLayer(
             const TensorSize inputSize,
-            const size_t outChannels,
-            const size_t filterSize,
-            const size_t stride,
+            const uint outChannels,
+            const uint filterSize,
+            const uint stride,
             const bool skipInputGrad,
             const Optimizer::OptimAlgo algorithm,
             const cudnnHandle_t handle):
@@ -86,8 +86,8 @@ public:
     }
 
 
-    void initWeights(const size_t seed) override {
-        const size_t filterInSize = inputSize.C * filterSize * filterSize;
+    void initWeights(const uint seed) override {
+        const uint filterInSize = inputSize.C * filterSize * filterSize;
         // He-Normal initialization for the convolution filter weights
         const float range = std::sqrt(2.0f / filterInSize);
         initRandomValues<true><<<ceilDiv(filtersFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
@@ -138,7 +138,7 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
+    void forward(float* d_inputTensor, const uint batchSize) override {
         // Save the borrowed input tensor for backward pass
         d_bPrevTensor = d_inputTensor;
         // Conditionally change the tensor sizes, convolutional algorithms 
@@ -158,7 +158,7 @@ public:
             if (currActualBatchSize < batchSize) {
                 currActualBatchSize = batchSize;
                 // Reallocate the output tensor buffer
-                const size_t fullOutSizeBytes = batchSize * outputSize.fullSize() * sizeof(float);
+                const uint fullOutSizeBytes = batchSize * outputSize.fullSize() * sizeof(float);
                 checkCuda(cudaFree(d_oOutTensor));
                 checkCuda(cudaMalloc(&d_oOutTensor, fullOutSizeBytes));
                 // Rebenchmark the convolutional algorithms and set workspace sizes
@@ -212,7 +212,7 @@ public:
                     cudnnWorkspaceBwdFilterSizeBytes = 0;
                 }
                 // Find maximal needed workspace size and reallocate if necessary
-                size_t maxWorkspaceSize = std::max({
+                uint maxWorkspaceSize = std::max({
                     cudnnWorkspaceFwdSizeBytes,
                     cudnnWorkspaceBwdDataSizeBytes,
                     cudnnWorkspaceBwdFilterSizeBytes
@@ -313,7 +313,7 @@ template <int FILTER_R_SIZE, int STRIDE>
 class DepthwiseConvolutionLayer : public LearnableLayer {
 private:
     bool skipInputGrad;
-    size_t filtersFullSize;
+    uint filtersFullSize;
     float* d_oOutTensor;
     float* d_oFiltersTensor;
     float* d_oFiltersGradTensor;
@@ -338,7 +338,7 @@ public:
     }
 
 
-    void initWeights(const size_t seed) override {
+    void initWeights(const uint seed) override {
         // He-Normal initialization for the convolution filter weights
         const float range = std::sqrt(2.0f / (FILTER_R_SIZE * FILTER_R_SIZE));
         initRandomValues<true><<<ceilDiv(filtersFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
@@ -387,7 +387,7 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
+    void forward(float* d_inputTensor, const uint batchSize) override {
         // Save the borrowed input tensor and batch size for backward pass
         d_bPrevTensor = d_inputTensor;
         currBatchSize = batchSize;
@@ -395,12 +395,12 @@ public:
         if (currActualBatchSize < batchSize) {
             currActualBatchSize = batchSize;
             checkCuda(cudaFree(d_oOutTensor));
-            const size_t fullOutSize = batchSize * outputSize.fullSize();
+            const uint fullOutSize = batchSize * outputSize.fullSize();
             checkCuda(cudaMalloc(&d_oOutTensor, fullOutSize * sizeof(float)));
         }
         // Compute the convolution forward pass to the owned output tensor
         const dim3 blockSize(BLOCK_X_SIZE, BLOCK_Y_SIZE);
-        const size_t outHBlocks = ceilDiv(outputSize.H, BLOCK_Y_SIZE);
+        const uint outHBlocks = ceilDiv(outputSize.H, BLOCK_Y_SIZE);
         const dim3 gridSize(ceilDiv(outputSize.W, BLOCK_X_SIZE), batchSize * inputSize.C * outHBlocks);
         depthwiseConvForward<BLOCK_X_SIZE, BLOCK_Y_SIZE, FILTER_R_SIZE, STRIDE><<<gridSize, blockSize>>>(
             d_oOutTensor, d_inputTensor, d_oFiltersTensor,
@@ -417,7 +417,7 @@ public:
         // Reclaim the incoming gradient tensor as owned output tensor
         d_oOutTensor = d_gradientTensor;
         // Accumulate the filter weight gradients into the owned grad tensor
-        const size_t gridSize = inputSize.C * FILTER_R_SIZE * FILTER_R_SIZE;
+        const uint gridSize = inputSize.C * FILTER_R_SIZE * FILTER_R_SIZE;
         depthwiseConvBackwardGrad<BLOCK_SIZE, FILTER_R_SIZE, STRIDE><<<gridSize, BLOCK_SIZE>>>(
             d_oFiltersGradTensor, d_gradientTensor, d_bPrevTensor, currBatchSize, inputSize.C,
             outputSize.H * outputSize.W, outputSize.W, inputSize.H, inputSize.W
@@ -426,7 +426,7 @@ public:
         // Conditionally compute the input gradients into the borrowed input tensor
         if (!skipInputGrad) {
             const dim3 blockSize(BLOCK_X_SIZE, BLOCK_Y_SIZE);
-            const size_t inHBlocks = ceilDiv(inputSize.H, BLOCK_Y_SIZE);
+            const uint inHBlocks = ceilDiv(inputSize.H, BLOCK_Y_SIZE);
             const dim3 gridSize(ceilDiv(inputSize.W, BLOCK_X_SIZE), currBatchSize * inputSize.C * inHBlocks);
             depthwiseConvBackward<BLOCK_X_SIZE, BLOCK_Y_SIZE, FILTER_R_SIZE, STRIDE><<<gridSize, blockSize>>>(
                 d_bPrevTensor, d_gradientTensor, d_oFiltersTensor,

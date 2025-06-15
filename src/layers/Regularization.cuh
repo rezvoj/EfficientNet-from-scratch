@@ -7,14 +7,14 @@
 #include "../utils/Exceptions.cuh"
 #include "../utils/Math.cuh"
 
-constexpr size_t BLOCK_SIZE = 256;
+constexpr uint BLOCK_SIZE = 256;
 
 
 
 class DropoutLayer : public Layer {
 private:
     float dropoutRate;
-    size_t dropoutSeed;
+    uint dropoutSeed;
     bool skipInputGrad;
     size_t cudnnDropoutStatesSize;
     size_t cudnnReserveSpaceSize;
@@ -28,7 +28,7 @@ public:
     DropoutLayer(
             const TensorSize inputSize,
             const float rate,
-            const size_t seed,
+            const uint seed,
             const bool skipInputGrad,
             const cudnnHandle_t handle): 
                 Layer(inputSize, inputSize),
@@ -71,7 +71,7 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
+    void forward(float* d_inputTensor, const uint batchSize) override {
         if (backOn) {
             // Conditionally change the tensor descriptor on batch size change
             if (currBatchSize != batchSize) {
@@ -205,7 +205,7 @@ public:
     }
 
 
-    void initWeights([[maybe_unused]] const size_t seed) override {
+    void initWeights([[maybe_unused]] const uint seed) override {
         // Initialize the scale, shift, running mean and variance to default values
         const dim3 gridSize(ceilDiv(outputSize.C, BLOCK_SIZE));
         initValues<<<gridSize, BLOCK_SIZE>>>(d_oScale, 1.0f, outputSize.C);
@@ -235,7 +235,7 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
+    void forward(float* d_inputTensor, const uint batchSize) override {
         // Save the borrowed input tensor for backward pass
         d_bPrevTensor = d_inputTensor;
         // Conditionally change the tensor descriptors on batch size change
@@ -248,7 +248,7 @@ public:
             // Reallocate memory only if it's actual size is smaller
             if (currActualBatchSize < batchSize) {
                 currActualBatchSize = batchSize;
-                const size_t fullSizeBytes = batchSize * outputSize.fullSize() * sizeof(float);
+                const uint fullSizeBytes = batchSize * outputSize.fullSize() * sizeof(float);
                 checkCuda(cudaFree(d_oOutTensor));
                 checkCuda(cudaMalloc(&d_oOutTensor, fullSizeBytes));
                 // Reallocate the backprob output tensor only during training 

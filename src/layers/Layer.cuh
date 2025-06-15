@@ -1,18 +1,18 @@
 #pragma once
 #include "../network/Optimizer.cuh"
 
-constexpr size_t BLOCK_SIZE = 256;
-constexpr size_t BLOCK_X_SIZE = 16;
-constexpr size_t BLOCK_Y_SIZE = 16;
+constexpr uint BLOCK_SIZE = 256;
+constexpr uint BLOCK_X_SIZE = 16;
+constexpr uint BLOCK_Y_SIZE = 16;
 
 
 
 struct TensorSize {
-    size_t C = 1;
-    size_t H = 1;
-    size_t W = 1;
+    uint C = 1;
+    uint H = 1;
+    uint W = 1;
     
-    size_t fullSize() const {
+    uint fullSize() const {
         return C * H * W;
     }
 
@@ -34,8 +34,8 @@ protected:
     bool backOn;
     TensorSize inputSize;
     TensorSize outputSize;
-    size_t currBatchSize;
-    size_t currActualBatchSize;
+    uint currBatchSize;
+    uint currActualBatchSize;
     Layer *prev, *next;
 
 public:
@@ -54,9 +54,10 @@ public:
     
     // Merhod to connect the layers with each other
     // Require the first layer's output size and second layer's input size to be the same
-    virtual void connect(Layer* nextLayer) {
+    virtual Layer* connect(Layer* nextLayer) {
         next = nextLayer;
         nextLayer->_setPrev(this);
+        return this;
     }
     
     // Changes the layer from training to inference mode and vice versa
@@ -72,7 +73,7 @@ public:
     // Performs forward pass calculation for the current layer
     // Potentially saves the borrowed tensor to non owning pointer
     // Borrows it's output tensor with the activation data to the next layer
-    virtual void forward(float* d_inputTensor, const size_t batchSize) = 0;
+    virtual void forward(float* d_inputTensor, const uint batchSize) = 0;
     
     // Performs backwards pass calculation for the current layer
     // Changes the memory buffer borrowing to memory trade contract
@@ -101,7 +102,7 @@ public:
                 optimizerAlgorithm(algorithm) {}
     
     // Initializes weights to internally spcified values
-    virtual void initWeights(const size_t seed) = 0;
+    virtual void initWeights(const uint seed) = 0;
 
     // Registers the layer's weight and weight gradient tensors
     // The registered tensors CAN'T be exchanged with other layers in memory trade

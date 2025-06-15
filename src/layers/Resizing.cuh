@@ -6,7 +6,7 @@
 #include "../utils/Exceptions.cuh"
 #include "../utils/Math.cuh"
 
-constexpr size_t BLOCK_SIZE = 256;
+constexpr uint BLOCK_SIZE = 256;
 
 
 
@@ -35,7 +35,7 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
+    void forward(float* d_inputTensor, const uint batchSize) override {
         // Save the borrowed input tensor
         d_bPrevTensor = d_inputTensor;
         // Conditionally change the tensor descriptors on batch size change
@@ -70,7 +70,7 @@ public:
 
 
     void backward(float* d_gradientTensor) override {
-        const size_t fullSize = currBatchSize * inputSize.fullSize();
+        const uint fullSize = currBatchSize * inputSize.fullSize();
         // Reclaim the incoming gradient tensor as owned output tensor
         d_oOutTensor = d_gradientTensor;
         // Expand and rescale the output tensor into the input tensor
@@ -122,8 +122,8 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
-        const size_t fullSize = batchSize * outputSize.fullSize();
+    void forward(float* d_inputTensor, const uint batchSize) override {
+        const uint fullSize = batchSize * outputSize.fullSize();
         // Save the borrowed input tensor
         d_bPrevTensor = d_inputTensor;
         // Conditionally change the tensor descriptors on batch size change

@@ -8,14 +8,14 @@
 #include "../utils/Exceptions.cuh"
 #include "../utils/Math.cuh"
 
-constexpr size_t BLOCK_SIZE = 256;
+constexpr uint BLOCK_SIZE = 256;
 
 
 
 class LinearLayer : public LearnableLayer {
 private:
     bool skipInputGrad;
-    size_t weightsFullSize;
+    uint weightsFullSize;
     float* d_oOutMatrix;
     float* d_oWeightMatrix;
     float* d_oWeightGradMatrix;
@@ -27,8 +27,8 @@ private:
 
 public:
     LinearLayer(
-            const size_t inNeurons,
-            const size_t outNeurons,
+            const uint inNeurons,
+            const uint outNeurons,
             const bool skipInputGrad,
             const Optimizer::OptimAlgo algorithm,
             const cublasHandle_t handle):
@@ -48,7 +48,7 @@ public:
     }
 
 
-    void initWeights(const size_t seed) override {
+    void initWeights(const uint seed) override {
         // He-Normal initialization for the linear layer weights
         const float range = std::sqrt(2.0f / inputSize.C);
         initRandomValues<true><<<ceilDiv(weightsFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
@@ -100,14 +100,14 @@ public:
     }
 
 
-    void forward(float* d_inputMatrix, const size_t batchSize) override {
+    void forward(float* d_inputMatrix, const uint batchSize) override {
         // Save the borrowed input matrix and batch size for backward pass
         d_bPrevMatrix = d_inputMatrix;
         currBatchSize = batchSize;
         // Conditionally reallocate the output matrix if buffer is too small
         if (currActualBatchSize < batchSize) {
             currActualBatchSize = batchSize;
-            const size_t fullOutSizeBytes = batchSize * outputSize.fullSize() * sizeof(float);
+            const uint fullOutSizeBytes = batchSize * outputSize.fullSize() * sizeof(float);
             checkCuda(cudaFree(d_oOutMatrix));
             checkCuda(cudaMalloc(&d_oOutMatrix, fullOutSizeBytes));
             if (backOn) {
@@ -133,7 +133,7 @@ public:
             &beta, d_oOutMatrix, outputSize.C
         )); 
         // Add the bias vector to each row of the output matrix
-        const size_t fullOutSize = currBatchSize * outputSize.C;
+        const uint fullOutSize = currBatchSize * outputSize.C;
         broadcastAddBiasInplace<<<ceilDiv(fullOutSize, BLOCK_SIZE), BLOCK_SIZE>>>(
             d_oOutMatrix, d_oBiasVector, outputSize.C, fullOutSize
         );

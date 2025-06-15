@@ -6,7 +6,7 @@
 #include "../utils/Exceptions.cuh"
 #include "../utils/Math.cuh"
 
-constexpr size_t BLOCK_SIZE = 256;
+constexpr uint BLOCK_SIZE = 256;
 
 
 
@@ -33,7 +33,7 @@ public:
     }
 
 
-    void forward(float* d_inputTensor, const size_t batchSize) override {
+    void forward(float* d_inputTensor, const uint batchSize) override {
         // Save the borrowed input tensor for backprop
         d_bPrevTensor = d_inputTensor;
         // Conditionally change the tensor descriptors on batch size change
@@ -70,7 +70,7 @@ public:
     // Fills the host buffer with the calculated probabilities
     // Only valid before starting backprop
     void getHostProbs(float* probTensor) {
-        const size_t copySizeBytes = currBatchSize * inputSize.C * sizeof(float);
+        const uint copySizeBytes = currBatchSize * inputSize.C * sizeof(float);
         checkCuda(cudaMemcpy(probTensor, d_bPrevTensor, copySizeBytes, cudaMemcpyDeviceToHost));
     }
 
@@ -110,7 +110,7 @@ public:
             cudaMemcpyHostToDevice
         ));
         // Calculate loss gradients into the borrowed input tensor
-        const size_t fullSize = currBatchSize * inputSize.C;
+        const uint fullSize = currBatchSize * inputSize.C;
         crossEntropyLossGradInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
             d_bPrevTensor, d_oLabelValues, currBatchSize, inputSize.C
         );
@@ -141,12 +141,12 @@ public:
 
     
     // Use start forward with host inputs instead of forward
-    void forward(float* d_inputTensor, const size_t batchSize) override {}
+    void forward(float* d_inputTensor, const uint batchSize) override {}
     
 
     // Copies the host input tensor to device and starts the forward pass chain
-    void startForward(float* inputTensor, const size_t batchSize) {
-        const size_t fullSize = batchSize * outputSize.fullSize();
+    void startForward(float* inputTensor, const uint batchSize) {
+        const uint fullSize = batchSize * outputSize.fullSize();
         // Reallocate memory only if it's actual size is smaller
         if (currActualBatchSize < batchSize) {
             currActualBatchSize = batchSize;
