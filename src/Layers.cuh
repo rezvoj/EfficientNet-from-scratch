@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <vector>
 #include <cudnn_v9.h>
+#include <cublas_v2.h> 
 #include "Kernels.cuh"
 #include "Utils.cuh"
 
@@ -270,7 +271,7 @@ public:
                 optimizerAlgorithm(algorithm) {}
     
     // Initializes weights to internally spcified values
-    virtual void initWeights(const size_t seed) = 0;
+    virtual void initWeights(const size_t seed, size_t& offset) = 0;
 
     // Registers the layer's weight and weight gradient tensors
     // The registered tensors CAN'T be exchanged with other layers in memory trade
@@ -1094,7 +1095,7 @@ public:
     }
 
 
-    void initWeights([[maybe_unused]] const size_t seed) override {
+    void initWeights([[maybe_unused]] const size_t seed, [[maybe_unused]] size_t& offset) override {
         // Initialize the scale, shift, running mean and variance to default values
         initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oScale, 1.0f, outputSize.C);
         checkCudaLastError();
@@ -1401,11 +1402,11 @@ private:
     float* d_oFiltersGradTensor;
     float* d_bPrevTensor;
     float* d_oCudnnWorkspace;
-    size_t cudnnWorkspaceActualSize;
+    size_t cudnnWorkspaceActualSizeBytes;
     cudnnHandle_t cudnnHandle;
-    size_t cudnnWorkspaceFwdSize;
-    size_t cudnnWorkspaceBwdDataSize;
-    size_t cudnnWorkspaceBwdFilterSize;
+    size_t cudnnWorkspaceFwdSizeBytes;
+    size_t cudnnWorkspaceBwdDataSizeBytes;
+    size_t cudnnWorkspaceBwdFilterSizeBytes;
     cudnnConvolutionFwdAlgo_t cudnnFwdAlgo;
     cudnnConvolutionBwdDataAlgo_t cudnnBwdDataAlgo;
     cudnnConvolutionBwdFilterAlgo_t cudnnBwdFilterAlgo;
@@ -1431,11 +1432,11 @@ public:
                 d_oFiltersGradTensor(nullptr),
                 d_bPrevTensor(nullptr),
                 d_oCudnnWorkspace(nullptr),
-                cudnnWorkspaceActualSize(0),
+                cudnnWorkspaceActualSizeBytes(0),
                 cudnnHandle(handle),
-                cudnnWorkspaceFwdSize(0),
-                cudnnWorkspaceBwdDataSize(0),
-                cudnnWorkspaceBwdFilterSize(0),
+                cudnnWorkspaceFwdSizeBytes(0),
+                cudnnWorkspaceBwdDataSizeBytes(0),
+                cudnnWorkspaceBwdFilterSizeBytes(0),
                 cudnnFwdAlgo(CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM),
                 cudnnBwdDataAlgo(CUDNN_CONVOLUTION_BWD_DATA_ALGO_1),
                 cudnnBwdFilterAlgo(CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1) {
@@ -1461,15 +1462,17 @@ public:
     }
 
 
-    void initWeights(const size_t seed) override {
+    void initWeights(const size_t seed, size_t& offset) override {
         const size_t filterInSize = inputSize.C * filterSize * filterSize;
         const size_t filterFullSize = outputSize.C * filterInSize;
         // He-Normal initialization for the convolution filter weights
         const float range = std::sqrt(2.0f / filterInSize);
         initRandomValues<true><<<ceilDiv(filterFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-            d_oFiltersTensor, seed, 0, range, filterFullSize
+            d_oFiltersTensor, seed, offset, range, filterFullSize
         );
         checkCudaLastError();
+        // Move the offset to prevent correlated random initialization
+        offset += filterFullSize;
     }
 
 
@@ -1506,7 +1509,7 @@ public:
         if (backOn != trainOn) {
             currBatchSize = 0;
             currActualBatchSize = 0;
-            cudnnWorkspaceActualSize = 0;
+            cudnnWorkspaceActualSizeBytes = 0;
         }
     }
 
@@ -1547,7 +1550,7 @@ public:
                 }
                 // Set the algorithm and workspace size for forward pass
                 cudnnFwdAlgo = fwdPerfResult.algo;
-                cudnnWorkspaceFwdSize = fwdPerfResult.memory;
+                cudnnWorkspaceFwdSizeBytes = fwdPerfResult.memory;
                 // Conditionally banchmark the backward algorithms and set workspace sizes
                 if (backOn) {
                     if (!skipInputGrad) {
@@ -1562,10 +1565,10 @@ public:
                         }
                         // Set the algorithm and workspace size for backward pass for input grad
                         cudnnBwdDataAlgo = bwdDataPerfResult.algo;
-                        cudnnWorkspaceBwdDataSize = bwdDataPerfResult.memory;
+                        cudnnWorkspaceBwdDataSizeBytes = bwdDataPerfResult.memory;
                     }
                     else {
-                        cudnnWorkspaceBwdDataSize = 0;
+                        cudnnWorkspaceBwdDataSizeBytes = 0;
                     }
                     // Benchmark the algorithm for the backward pass for filter weights grad
                     cudnnConvolutionBwdFilterAlgoPerf_t bwdFilterPerfResult;
@@ -1578,29 +1581,29 @@ public:
                     }
                     // Set the algorithm and workspace size for backward pass for filter weights grad
                     cudnnBwdFilterAlgo = bwdFilterPerfResult.algo;
-                    cudnnWorkspaceBwdFilterSize = bwdFilterPerfResult.memory;
+                    cudnnWorkspaceBwdFilterSizeBytes = bwdFilterPerfResult.memory;
                 }
                 else {
-                    cudnnWorkspaceBwdDataSize = 0;
-                    cudnnWorkspaceBwdFilterSize = 0;
+                    cudnnWorkspaceBwdDataSizeBytes = 0;
+                    cudnnWorkspaceBwdFilterSizeBytes = 0;
                 }
                 // Find maximal needed workspace size and reallocate if necessary
                 size_t maxWorkspaceSize = std::max({
-                    cudnnWorkspaceFwdSize,
-                    cudnnWorkspaceBwdDataSize,
-                    cudnnWorkspaceBwdFilterSize
+                    cudnnWorkspaceFwdSizeBytes,
+                    cudnnWorkspaceBwdDataSizeBytes,
+                    cudnnWorkspaceBwdFilterSizeBytes
                 });
-                if (cudnnWorkspaceActualSize < maxWorkspaceSize) {
-                    cudnnWorkspaceActualSize = maxWorkspaceSize;
+                if (cudnnWorkspaceActualSizeBytes < maxWorkspaceSize) {
+                    cudnnWorkspaceActualSizeBytes = maxWorkspaceSize;
                     checkCuda(cudaFree(d_oCudnnWorkspace));
-                    checkCuda(cudaMalloc(&d_oCudnnWorkspace, cudnnWorkspaceActualSize));
+                    checkCuda(cudaMalloc(&d_oCudnnWorkspace, cudnnWorkspaceActualSizeBytes));
                 }
             }
             else {
                 // Set workspace size for the forward pass with the existing algorithm
                 checkCudnn(cudnnGetConvolutionForwardWorkspaceSize(
                     cudnnHandle, cudnnInTensorDesc, cudnnFilterDesc, cudnnConvDesc, cudnnOutTensorDesc,
-                    cudnnFwdAlgo, &cudnnWorkspaceFwdSize
+                    cudnnFwdAlgo, &cudnnWorkspaceFwdSizeBytes
                 ));
                 // Conditionally set workspace sizes for the backward passes
                 if (backOn) {
@@ -1608,21 +1611,21 @@ public:
                     if (!skipInputGrad) {
                         checkCudnn(cudnnGetConvolutionBackwardDataWorkspaceSize(
                             cudnnHandle, cudnnFilterDesc, cudnnOutTensorDesc, cudnnConvDesc, cudnnInTensorDesc,
-                            cudnnBwdDataAlgo, &cudnnWorkspaceBwdDataSize
+                            cudnnBwdDataAlgo, &cudnnWorkspaceBwdDataSizeBytes
                         ));
                     }
                     else {
-                        cudnnWorkspaceBwdDataSize = 0;
+                        cudnnWorkspaceBwdDataSizeBytes = 0;
                     }
                     // Set workspace size for the backward filter pass
                     checkCudnn(cudnnGetConvolutionBackwardFilterWorkspaceSize(
                         cudnnHandle, cudnnInTensorDesc, cudnnOutTensorDesc, cudnnConvDesc, cudnnFilterDesc,
-                        cudnnBwdFilterAlgo, &cudnnWorkspaceBwdFilterSize
+                        cudnnBwdFilterAlgo, &cudnnWorkspaceBwdFilterSizeBytes
                     ));
                 }
                 else {
-                    cudnnWorkspaceBwdDataSize = 0;
-                    cudnnWorkspaceBwdFilterSize = 0;
+                    cudnnWorkspaceBwdDataSizeBytes = 0;
+                    cudnnWorkspaceBwdFilterSizeBytes = 0;
                 }
             }
         }
@@ -1631,7 +1634,7 @@ public:
         // Compute the convolution forward pass to the owned output tensor
         checkCudnn(cudnnConvolutionForward(
             cudnnHandle, &alpha, cudnnInTensorDesc, d_inputTensor, cudnnFilterDesc, d_oFiltersTensor,
-            cudnnConvDesc, cudnnFwdAlgo, d_oCudnnWorkspace, cudnnWorkspaceFwdSize,
+            cudnnConvDesc, cudnnFwdAlgo, d_oCudnnWorkspace, cudnnWorkspaceFwdSizeBytes,
             &beta, cudnnOutTensorDesc, d_oOutTensor
         ));
         // Lend the output tensor with activation data to the next layer
@@ -1647,7 +1650,7 @@ public:
         const float beta_accumulate = 1.0f;
         checkCudnn(cudnnConvolutionBackwardFilter(
             cudnnHandle, &alpha, cudnnInTensorDesc, d_bPrevTensor, cudnnOutTensorDesc, d_gradientTensor,
-            cudnnConvDesc, cudnnBwdFilterAlgo, d_oCudnnWorkspace, cudnnWorkspaceBwdFilterSize,
+            cudnnConvDesc, cudnnBwdFilterAlgo, d_oCudnnWorkspace, cudnnWorkspaceBwdFilterSizeBytes,
             &beta_accumulate, cudnnFilterDesc, d_oFiltersGradTensor
         ));
         // Conditionally compute the input gradients into the borrowed input tensor
@@ -1655,7 +1658,7 @@ public:
         if (!skipInputGrad) {
             checkCudnn(cudnnConvolutionBackwardData(
                 cudnnHandle, &alpha, cudnnFilterDesc, d_oFiltersTensor, cudnnOutTensorDesc, d_gradientTensor,
-                cudnnConvDesc, cudnnBwdDataAlgo, d_oCudnnWorkspace, cudnnWorkspaceBwdDataSize,
+                cudnnConvDesc, cudnnBwdDataAlgo, d_oCudnnWorkspace, cudnnWorkspaceBwdDataSizeBytes,
                 &beta_overwrite, cudnnInTensorDesc, d_bPrevTensor
             ));
         }
@@ -1675,6 +1678,203 @@ public:
             checkCudnn(cudnnDestroyTensorDescriptor(cudnnOutTensorDesc));
             checkCudnn(cudnnDestroyFilterDescriptor(cudnnFilterDesc));
             checkCudnn(cudnnDestroyConvolutionDescriptor(cudnnConvDesc));
+        }
+    }
+
+};
+
+
+
+class LinearLayer : public LearnableLayer {
+private:
+    bool skipInputGrad;
+    float* d_oOutMatrix;
+    float* d_oWeightMatrix;
+    float* d_oWeightGradMatrix;
+    float* d_oBiasVector;
+    float* d_oBiasGradVector;
+    float* d_oBatchOnesVector;
+    float* d_bPrevMatrix;
+    cublasHandle_t cublasHandle;
+
+public:
+    LinearLayer(
+            const size_t inNeurons,
+            const size_t outNeurons,
+            const bool skipInputGrad,
+            const Optimizer::OptimAlgo algorithm,
+            const cublasHandle_t handle):
+                LearnableLayer({inNeurons, 1, 1}, {outNeurons, 1, 1}, algorithm),
+                skipInputGrad(skipInputGrad),
+                d_oOutMatrix(nullptr),
+                d_oWeightMatrix(nullptr),
+                d_oWeightGradMatrix(nullptr),
+                d_oBiasVector(nullptr),
+                d_oBiasGradVector(nullptr),
+                d_oBatchOnesVector(nullptr),
+                d_bPrevMatrix(nullptr),
+                cublasHandle(handle) {
+        const size_t weightsFullSize = outputSize.C * inputSize.C;
+        checkCuda(cudaMalloc(&d_oWeightMatrix, weightsFullSize * sizeof(float)));
+        checkCuda(cudaMalloc(&d_oBiasVector, outputSize.C * sizeof(float)));
+    }
+
+
+    void initWeights(const size_t seed, size_t& offset) override {
+        const size_t weightsFullSize = outputSize.C * inputSize.C;
+        // He-Normal initialization for the linear layer weights
+        const float range = std::sqrt(2.0f / inputSize.C);
+        initRandomValues<true><<<ceilDiv(weightsFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_oWeightMatrix, seed, offset, range, weightsFullSize
+        );
+        checkCudaLastError();
+        // Move the offset to prevent correlated random initialization
+        offset += weightsFullSize;
+        // Zero initialize the biases
+        initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_oBiasVector, 0.0f, outputSize.C
+        );
+        checkCudaLastError();
+    }
+
+
+    void registerWeights(Optimizer& optimizer) override {
+        if (backOn) {
+            const size_t weightsFullSize = outputSize.C * inputSize.C;
+            optimizer.registerLayer(optimizerAlgorithm, d_oWeightMatrix, d_oWeightGradMatrix, weightsFullSize);
+            optimizer.registerLayer(optimizerAlgorithm, d_oBiasVector, d_oBiasGradVector, outputSize.C);
+        }
+    }
+
+
+    void reRegisterGrads(Optimizer& optimizer) override {
+        if (backOn) {
+            optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oWeightMatrix, d_oWeightGradMatrix);
+            optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oBiasVector, d_oBiasGradVector);
+        }
+    }
+
+
+    void toggleTrain(const bool trainOn) override {
+        if (!backOn && trainOn) {
+            backOn = true;
+            // Allocate resources independant on batch size
+            const size_t weightsFullSize = outputSize.C * inputSize.C;
+            checkCuda(cudaMalloc(&d_oWeightGradMatrix, weightsFullSize * sizeof(float)));
+            checkCuda(cudaMalloc(&d_oBiasGradVector, outputSize.C * sizeof(float)));
+        }
+        else if (backOn && !trainOn) {
+            backOn = false;
+            // Free the unnecessary memory for inference
+            checkCuda(cudaFree(d_oWeightGradMatrix));
+            checkCuda(cudaFree(d_oBiasGradVector));
+            checkCuda(cudaFree(d_oBatchOnesVector));
+            d_oWeightGradMatrix = nullptr;
+            d_oBiasGradVector = nullptr;
+            d_oBatchOnesVector = nullptr;
+        }
+        if (backOn != trainOn) {
+            backOn = trainOn;
+            // Reset the batch sizes to force buffer reallocations
+            currBatchSize = 0;
+            currActualBatchSize = 0;
+        }
+    }
+
+
+    void forward(float* d_inputMatrix, const size_t batchSize) override {
+        // Save the borrowed input matrix and batch size for backward pass
+        d_bPrevMatrix = d_inputMatrix;
+        currBatchSize = batchSize;
+        // Conditionally reallocate the output matrix if buffer is too small
+        if (currActualBatchSize < batchSize) {
+            currActualBatchSize = batchSize;
+            const size_t fullOutSizeBytes = batchSize * outputSize.fullSize() * sizeof(float);
+            checkCuda(cudaFree(d_oOutMatrix));
+            checkCuda(cudaMalloc(&d_oOutMatrix, fullOutSizeBytes));
+            if (backOn) {
+                // Reinitialize the vector of ones with the size of a batch
+                checkCuda(cudaFree(d_oBatchOnesVector));
+                checkCuda(cudaMalloc(&d_oBatchOnesVector, batchSize * sizeof(float)));
+                initValues<<<ceilDiv(batchSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+                    d_oBatchOnesVector, 1.0f, batchSize
+                );
+                checkCudaLastError();
+            }
+        }
+        // Computes the activations into the owned output matrix
+        // The matmul operation from the row-wise perspective: 
+        //  (N, C_in) @ (C_out, C_in)^T = (N, C_out)
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        checkCublas(cublasSgemm_v2(
+            cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+            outputSize.C, batchSize, inputSize.C,
+            &alpha, d_oWeightMatrix, inputSize.C, 
+            d_inputMatrix, inputSize.C,
+            &beta, d_oOutMatrix, outputSize.C
+        )); 
+        // Add the bias vector to each row of the output matrix
+        const size_t fullOutSize = currBatchSize * outputSize.C;
+        broadcastAddBiasInplace<<<ceilDiv(fullOutSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_oOutMatrix, d_oBiasVector, outputSize.C, fullOutSize
+        );
+        // Lend the output matrix with activation data to the next layer
+        next->forward(d_oOutMatrix, batchSize);
+    }
+
+
+    void backward(float* d_gradientMatrix) override {
+        // Reclaim the incoming gradient matrix as owned output matrix
+        d_oOutMatrix = d_gradientMatrix;
+        // Accumulate the bias gradients into the owned bias grad vector
+        // The matmul operation from the row-wise perspective: 
+        //  (N) @ (N, C_out) = (C_out)
+        const float alpha = 1.0f;
+        const float beta_accumulate = 1.0f;
+        checkCublas(cublasSgemv_v2(
+            cublasHandle, CUBLAS_OP_N, outputSize.C, currBatchSize,
+            &alpha, d_gradientMatrix, outputSize.C,
+            d_oBatchOnesVector, 1,
+            &beta_accumulate, d_oBiasGradVector, 1
+        ));
+        // Accumulate the weight gradients into the owned weight grad matrix
+        // The matmul operation from the row-wise perspective: 
+        //  (N, C_out)^T @ (N, C_in) = (C_out, C_in)
+        checkCublas(cublasSgemm_v2(
+            cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
+            inputSize.C, outputSize.C, currBatchSize,
+            &alpha, d_bPrevMatrix, inputSize.C,
+            d_gradientMatrix, outputSize.C,
+            &beta_accumulate, d_oWeightGradMatrix, inputSize.C
+        ));
+        // Conditionally compute the input matrix gradient into borrowed prev matrix
+        if (!skipInputGrad) {
+            // The matmul operation from the row-wise perspective:
+            //  (N, C_out) @ (C_out, C_in) = (N, C_in)
+            const float beta_overwrite = 0.0f;
+            checkCublas(cublasSgemm_v2(
+                cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+                inputSize.C, currBatchSize, outputSize.C,
+                &alpha, d_oWeightMatrix, inputSize.C,
+                d_gradientMatrix, outputSize.C,
+                &beta_overwrite, d_bPrevMatrix, inputSize.C
+            ));
+        }
+        // Complete memory the trade by returning the input matrix
+        //  conditionally with gradient data
+        prev->backward(d_bPrevMatrix);
+    }
+
+
+    ~LinearLayer() override {
+        if (!std::uncaught_exceptions()) {
+            checkCuda(cudaFree(d_oOutMatrix));
+            checkCuda(cudaFree(d_oWeightMatrix));
+            checkCuda(cudaFree(d_oWeightGradMatrix));
+            checkCuda(cudaFree(d_oBiasVector));
+            checkCuda(cudaFree(d_oBiasGradVector));
+            checkCuda(cudaFree(d_oBatchOnesVector));
         }
     }
 

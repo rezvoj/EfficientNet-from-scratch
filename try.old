@@ -1,0 +1,496 @@
+// #include <iostream>
+// #include <cublasLt.h>
+// #include <cublas_v2.h> // Added for standard cuBLAS
+// #include <cuda_runtime.h>
+// #include <iomanip>
+
+// #define checkCuda(func) do { cudaError_t err = (func); if (err != cudaSuccess) { std::cerr << "CUDA error " << err << " at " << __FILE__ << ":" << __LINE__ << ": " << cudaGetErrorString(err) << std::endl; exit(EXIT_FAILURE); } } while (0)
+// #define checkCublas(func) do { cublasStatus_t status = (func); if (status != CUBLAS_STATUS_SUCCESS) { std::cerr << "cuBLAS error " << status << " at " << __FILE__ << ":" << __LINE__ << std::endl; exit(EXIT_FAILURE); } } while (0)
+
+// // Custom kernel to add a bias vector to a matrix
+// // Each thread handles one element of the output matrix C.
+// __global__ void add_bias_kernel(float* C, const float* bias, int m, int n) {
+//     int row = blockIdx.y * blockDim.y + threadIdx.y;
+//     int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+//     if (row < m && col < n) {
+//         C[row * n + col] += bias[col];
+//     }
+// }
+
+// int main() {
+//     // Neural Net Layer Dimensions
+//     int batch_size = 256;
+//     int neurons_in = 1024;
+//     int neurons_out = 512;
+//     int iterations = 1000;
+
+//     // Map to GEMM: C(m,n) = A(m,k) @ B(k,n)
+//     int m = batch_size;
+//     int k = neurons_in;
+//     int n = neurons_out;
+
+//     std::cout << "Benchmarking Fused cuBLASLt vs. Standard cuBLAS + Custom Kernel" << std::endl;
+//     std::cout << "Dimensions: C(" << m << "," << n << ") = A(" << m << "," << k << ") @ B(" << k << "," << n << ") + Bias(" << n << ")" << std::endl;
+//     std::cout << "------------------------------------------------------------------" << std::endl;
+
+//     // --- Memory Allocation ---
+//     void *d_a, *d_b, *d_bias;
+//     void *d_c_fused;     // Output buffer for the fused operation
+//     void *d_c_separate;  // Output buffer for the separate operation
+
+//     checkCuda(cudaMalloc(&d_a, (size_t)m * k * sizeof(float)));
+//     checkCuda(cudaMalloc(&d_b, (size_t)k * n * sizeof(float)));
+//     checkCuda(cudaMalloc(&d_bias, (size_t)n * sizeof(float)));
+//     checkCuda(cudaMalloc(&d_c_fused, (size_t)m * n * sizeof(float)));
+//     checkCuda(cudaMalloc(&d_c_separate, (size_t)m * n * sizeof(float)));
+
+//     // --- Handle Creation ---
+//     cublasLtHandle_t ltHandle;
+//     checkCublas(cublasLtCreate(&ltHandle));
+//     cublasHandle_t regularHandle; // Handle for standard cuBLAS
+//     checkCublas(cublasCreate(&regularHandle));
+
+//     float time_fused, time_separate;
+//     const float alpha = 1.0f, beta = 0.0f;
+
+//     // --- Scenario 1: Fused Matmul + Bias (cuBLASLt) ---
+//     // This scenario remains unchanged.
+//     std::cout << "Running Scenario 1: Fused Matmul + Bias via cuBLASLt Epilogue..." << std::endl;
+//     {
+//         cublasLtMatmulPreference_t preference;
+//         checkCublas(cublasLtMatmulPreferenceCreate(&preference));
+//         uint64_t workspaceSize = 32 * 1024 * 1024; // 32MB
+//         checkCublas(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
+
+//         cublasLtMatrixLayout_t layoutA, layoutB, layoutC;
+//         checkCublas(cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_32F, m, k, m));
+//         checkCublas(cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_32F, k, n, k));
+//         checkCublas(cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_32F, m, n, m));
+
+//         cublasLtMatmulDesc_t opDesc;
+//         checkCublas(cublasLtMatmulDescCreate(&opDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+
+//         cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+//         checkCublas(cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+//         checkCublas(cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &d_bias, sizeof(d_bias)));
+
+//         cublasLtMatmulHeuristicResult_t heuristicResult = {};
+//         int returnedResults = 0;
+//         checkCublas(cublasLtMatmulAlgoGetHeuristic(ltHandle, opDesc, layoutA, layoutB, layoutC, layoutC, preference, 1, &heuristicResult, &returnedResults));
+//         if (returnedResults == 0) { std::cerr << "No algorithm found for fused op" << std::endl; return 1; }
+
+//         void* workspace = nullptr;
+//         if (heuristicResult.workspaceSize > 0) checkCuda(cudaMalloc(&workspace, heuristicResult.workspaceSize));
+
+//         cudaEvent_t start, stop;
+//         checkCuda(cudaEventCreate(&start));
+//         checkCuda(cudaEventCreate(&stop));
+//         checkCuda(cudaEventRecord(start));
+//         for (int i = 0; i < iterations; ++i) {
+//             checkCublas(cublasLtMatmul(ltHandle, opDesc, &alpha, d_a, layoutA, d_b, layoutB, &beta, d_c_fused, layoutC, d_c_fused, layoutC, &heuristicResult.algo, workspace, heuristicResult.workspaceSize, 0));
+//         }
+
+//         checkCuda(cudaEventRecord(stop));
+//         checkCuda(cudaEventSynchronize(stop));
+//         checkCuda(cudaEventElapsedTime(&time_fused, start, stop));
+
+//         if (workspace) checkCuda(cudaFree(workspace));
+
+
+//         checkCublas(cublasLtMatmulPreferenceDestroy(preference));
+//         checkCublas(cublasLtMatmulDescDestroy(opDesc));
+        
+//         checkCublas(cublasLtMatrixLayoutDestroy(layoutC));
+//         checkCublas(cublasLtMatrixLayoutDestroy(layoutB));
+//         checkCublas(cublasLtMatrixLayoutDestroy(layoutA));
+
+
+//         std::cout << "  > Average time: " << std::fixed << std::setprecision(6) << time_fused / iterations << " ms" << std::endl << std::endl;
+//     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+//     // --- Scenario 2: Separate Matmul (standard cuBLAS) and Bias Kernel ---
+//     // This scenario is now changed to use standard cublasSgemm.
+//     std::cout << "Running Scenario 2: Separate Matmul (standard cuBLAS) then Custom Bias Kernel..." << std::endl;
+//     {
+//         dim3 block_dim(16, 16);
+//         dim3 grid_dim((n + block_dim.x - 1) / block_dim.x, (m + block_dim.y - 1) / block_dim.y);
+
+//         cudaEvent_t start, stop;
+//         checkCuda(cudaEventCreate(&start));
+//         checkCuda(cudaEventCreate(&stop));
+//         checkCuda(cudaEventRecord(start));
+//         for (int i = 0; i < iterations; ++i) {
+//             // Step 1: Matmul with cublasSgemm
+//             // NOTE: cublasSgemm assumes column-major layout. Our data is row-major.
+//             // The standard trick is to compute C^T = B^T @ A^T.
+//             // If A is (m,k) and B is (k,n) in row-major, we treat them as
+//             // A^T (k,m) and B^T (n,k) in column-major.
+//             // The call to cublasSgemm then becomes cublasSgemm(n, m, k, B, A, C).
+//             checkCublas(cublasSgemm(regularHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+//                                     n, m, k,
+//                                     &alpha,
+//                                     static_cast<const float*>(d_b), n,
+//                                     static_cast<const float*>(d_a), k,
+//                                     &beta,
+//                                     static_cast<float*>(d_c_separate), n));
+
+//             // Step 2: Custom Kernel for bias addition
+//             add_bias_kernel<<<grid_dim, block_dim>>>(static_cast<float*>(d_c_separate), static_cast<const float*>(d_bias), m, n);
+//         }
+//         checkCuda(cudaEventRecord(stop));
+//         checkCuda(cudaEventSynchronize(stop));
+//         checkCuda(cudaEventElapsedTime(&time_separate, start, stop));
+
+//         std::cout << "  > Average time: " << std::fixed << std::setprecision(6) << time_separate / iterations << " ms" << std::endl << std::endl;
+//     }
+
+//     // --- Conclusion ---
+//     std::cout << "------------------------------------------------------------------" << std::endl;
+//     float fused_avg = time_fused / iterations;
+//     float separate_avg = time_separate / iterations;
+//     float improvement = (separate_avg - fused_avg) / separate_avg * 100.0f;
+//     std::cout << "Conclusion: The fused cuBLASLt operation was FASTER than standard cuBLAS + kernel by " << std::fixed << std::setprecision(2) << improvement << "%." << std::endl;
+
+//     // --- Cleanup ---
+//     checkCuda(cudaFree(d_c_separate));
+//     checkCuda(cudaFree(d_c_fused));
+//     checkCuda(cudaFree(d_bias));
+//     checkCuda(cudaFree(d_b));
+//     checkCuda(cudaFree(d_a));
+//     checkCublas(cublasDestroy(regularHandle)); // Destroy the standard handle
+//     checkCublas(cublasLtDestroy(ltHandle));
+
+//     return 0;
+// }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// #include <iostream>
+// #include <iomanip>
+// #include <vector>
+// #include <numeric>
+
+// #include <cub/cub.cuh>
+// #include <cublas_v2.h>
+// #include <cuda_runtime.h>
+
+// #define checkCuda(func) do { cudaError_t err = (func); if (err != cudaSuccess) { std::cerr << "CUDA error " << err << " at " << __FILE__ << ":" << __LINE__ << ": " << cudaGetErrorString(err) << std::endl; exit(EXIT_FAILURE); } } while (0)
+// #define checkCublas(func) do { cublasStatus_t status = (func); if (status != CUBLAS_STATUS_SUCCESS) { std::cerr << "cuBLAS error " << status << " at " << __FILE__ << ":" << __LINE__ << std::endl; exit(EXIT_FAILURE); } } while (0)
+
+// // ==================================================================
+// // Custom Reduction Kernel
+// // ==================================================================
+
+
+
+
+
+
+// // Helper device function to reduce a value across all active threads in a warp
+// __device__ inline float warpReduce(float val) {
+//     // Sequentially perform a reduction over the warp using shuffle-down instructions
+//     // This is safe and does not require __syncwarp()
+//     for (int offset = 16; offset > 0; offset /= 2) {
+//         val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+//     }
+//     return val; // The root lane (lane 0) of the warp holds the final sum
+// }
+
+
+// // Kernel implementing the two-stage reduction strategy
+// __global__ void custom_reduction_kernel(const float* errors, float* bias_grads, int batch_size) {
+//     // --- Constants and Indices ---
+//     constexpr int BLOCK_SIZE = 256;
+//     constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / 32;
+
+//     const int thread_id = threadIdx.x;
+//     const int warp_id = thread_id / 32;
+//     const int lane_id = thread_id % 32;
+//     const int col_idx = blockIdx.x; // Each block handles one column (one output bias gradient)
+
+//     // --- Shared Memory ---
+//     // One slot per warp to store partial reduction results
+//     __shared__ float partial_sums[WARPS_PER_BLOCK];
+
+//     // --- Step 1: Each thread sums up its portion of the column data ---
+//     // This is a grid-stride loop. It correctly handles cases where batch_size > BLOCK_SIZE
+//     // and automatically handles padding (threads with thread_id >= batch_size don't loop).
+//     float thread_sum = 0.0f;
+//     for (int i = thread_id; i < batch_size; i += BLOCK_SIZE) {
+//         thread_sum += errors[(size_t)col_idx * batch_size + i];
+//     }
+
+//     // --- Step 2: First stage reduction (within each warp) ---
+//     thread_sum = warpReduce(thread_sum);
+
+//     // --- Step 3: Store warp results in shared memory ---
+//     // The first thread of each warp writes its partial sum to shared memory
+//     if (lane_id == 0) {
+//         partial_sums[warp_id] = thread_sum;
+//     }
+
+//     // --- Step 4: Synchronize all threads in the block ---
+//     // Ensure all warps have written to shared memory before the next stage
+//     __syncthreads();
+
+//     // --- Step 5: Second stage reduction (first warp reduces shared memory) ---
+//     // Only the first warp (warp_id == 0) will do this work.
+//     // Load the partial sums from shared memory into the first warp's threads.
+//     // Other warps can exit.
+//     if (warp_id == 0) {
+//         // If lane_id < WARPS_PER_BLOCK, load a value, otherwise load 0.
+//         // This handles cases where there are fewer warps than 32 (the size of the first warp).
+//         float final_sum = (lane_id < WARPS_PER_BLOCK) ? partial_sums[lane_id] : 0.0f;
+
+//         // Perform the final reduction within the first warp
+//         final_sum = warpReduce(final_sum);
+
+//         // --- Step 6: Final write ---
+//         // The first thread of the entire block (thread 0) writes the final result.
+//         if (lane_id == 0) {
+//             bias_grads[col_idx] = final_sum;
+//         }
+//     }
+// }
+
+
+// #include <iostream>
+// #include <iomanip>
+// #include <vector>
+// #include <numeric>
+
+// #include <cub/cub.cuh>
+// #include <cublas_v2.h>
+// #include <cuda_runtime.h>
+
+// #define checkCuda(func) do { cudaError_t err = (func); if (err != cudaSuccess) { std::cerr << "CUDA error " << err << " at " << __FILE__ << ":" << __LINE__ << ": " << cudaGetErrorString(err) << std::endl; exit(EXIT_FAILURE); } } while (0)
+// #define checkCublas(func) do { cublasStatus_t status = (func); if (status != CUBLAS_STATUS_SUCCESS) { std::cerr << "cuBLAS error " << status << " at " << __FILE__ << ":" << __LINE__ << std::endl; exit(EXIT_FAILURE); } } while (0)
+
+// // ==================================================================
+// // Reduction Kernels
+// // ==================================================================
+
+// // Helper device function (same as before)
+// __device__ inline float warpReduce(float val) {
+//     for (int offset = 16; offset > 0; offset /= 2) {
+//         val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+//     }
+//     return val;
+// }
+
+// // KERNEL 1: The warp-centric kernel from before (our current champion)
+// __global__ void warp_centric_reduction_kernel(const float* errors, float* bias_grads, int batch_size) {
+//     constexpr int BLOCK_SIZE = 256;
+//     constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / 32;
+//     const int thread_id = threadIdx.x;
+//     const int warp_id = thread_id / 32;
+//     const int lane_id = thread_id % 32;
+//     const int col_idx = blockIdx.x;
+//     __shared__ float partial_sums[WARPS_PER_BLOCK];
+
+//     float thread_sum = 0.0f;
+//     for (int i = thread_id; i < batch_size; i += BLOCK_SIZE) {
+//         thread_sum += errors[(size_t)col_idx * batch_size + i];
+//     }
+//     thread_sum = warpReduce(thread_sum);
+//     if (lane_id == 0) {
+//         partial_sums[warp_id] = thread_sum;
+//     }
+//     __syncthreads();
+//     if (warp_id == 0) {
+//         float final_sum = (lane_id < WARPS_PER_BLOCK) ? partial_sums[lane_id] : 0.0f;
+//         final_sum = warpReduce(final_sum);
+//         if (lane_id == 0) {
+//             bias_grads[col_idx] = final_sum;
+//         }
+//     }
+// }
+
+// // KERNEL 2: The __syncthreads__ loop-based kernel you asked for
+// __global__ void syncthreads_loop_reduction_kernel(const float* errors, float* bias_grads, int batch_size) {
+//     constexpr int BLOCK_SIZE = 256;
+//     const int thread_id = threadIdx.x;
+//     const int col_idx = blockIdx.x;
+
+//     // Shared memory for all threads in the block
+//     __shared__ float partial_sums[BLOCK_SIZE];
+
+//     // Each thread sums up its portion of the column data (grid-stride loop)
+//     float thread_sum = 0.0f;
+//     for (int i = thread_id; i < batch_size; i += BLOCK_SIZE) {
+//         thread_sum += errors[(size_t)col_idx * batch_size + i];
+//     }
+//     partial_sums[thread_id] = thread_sum;
+//     __syncthreads(); // Ensure all threads have loaded their sum
+
+//     // The __syncthreads__ loop for reduction
+//     // We stop when the number of active threads is <= 32, then switch to warp shuffle
+//     for (unsigned int s = BLOCK_SIZE / 2; s > 32; s >>= 1) {
+//         if (thread_id < s) {
+//             partial_sums[thread_id] += partial_sums[thread_id + s];
+//         }
+//         __syncthreads();
+//     }
+
+//     // The final reduction is done by the first warp
+//     if (thread_id < 32) {
+//         // The last step of the tree-based reduction (from 64 elements to 32)
+//         // is combined with the warp shuffle for efficiency.
+//         float final_sum = partial_sums[thread_id] + partial_sums[thread_id + 32];
+//         final_sum = warpReduce(final_sum);
+
+//         if (thread_id == 0) {
+//             bias_grads[col_idx] = final_sum;
+//         }
+//     }
+// }
+
+
+// int main() {
+//     int batch_size = 3200;
+//     int C_out = 5120;
+//     int iterations = 1000;
+
+//     std::cout << "Benchmark: Two Custom Kernels vs CUB vs cuBLAS" << std::endl;
+//     std::cout << "------------------------------------------------------------------" << std::endl;
+
+//     // --- Memory Allocation ---
+//     float *d_errors_col_major;
+//     float *d_bias_grad_cub, *d_bias_grad_gemv, *d_bias_grad_warp, *d_bias_grad_syncloop;
+//     int   *d_offsets;
+//     float *d_ones;
+
+//     size_t matrix_bytes = (size_t)batch_size * C_out * sizeof(float);
+//     checkCuda(cudaMalloc(&d_errors_col_major, matrix_bytes));
+//     checkCuda(cudaMalloc(&d_bias_grad_cub, C_out * sizeof(float)));
+//     checkCuda(cudaMalloc(&d_bias_grad_gemv, C_out * sizeof(float)));
+//     checkCuda(cudaMalloc(&d_bias_grad_warp, C_out * sizeof(float)));
+//     checkCuda(cudaMalloc(&d_bias_grad_syncloop, C_out * sizeof(float)));
+//     checkCuda(cudaMalloc(&d_offsets, (C_out + 1) * sizeof(int)));
+//     checkCuda(cudaMalloc(&d_ones, batch_size * sizeof(float)));
+
+//     // --- Setup (same as before) ---
+//     std::vector<int> h_offsets(C_out + 1);
+//     for (int i = 0; i <= C_out; ++i) h_offsets[i] = i * batch_size;
+//     checkCuda(cudaMemcpy(d_offsets, h_offsets.data(), (C_out + 1) * sizeof(int), cudaMemcpyHostToDevice));
+//     std::vector<float> h_ones(batch_size, 1.0f);
+//     checkCuda(cudaMemcpy(d_ones, h_ones.data(), batch_size * sizeof(float), cudaMemcpyHostToDevice));
+//     cublasHandle_t cublas_handle;
+//     checkCublas(cublasCreate(&cublas_handle));
+//     void* d_temp_storage = nullptr;
+//     size_t temp_storage_bytes = 0;
+//     cub::DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_errors_col_major, d_bias_grad_cub, C_out, d_offsets, d_offsets + 1);
+//     checkCuda(cudaMalloc(&d_temp_storage, temp_storage_bytes));
+//     cudaEvent_t start, stop;
+//     checkCuda(cudaEventCreate(&start));
+//     checkCuda(cudaEventCreate(&stop));
+//     float time_ms;
+
+//     // ==================================================================
+//     // Run Benchmarks
+//     // ==================================================================
+//     dim3 grid_dim(C_out, 1, 1);
+//     dim3 block_dim(256, 1, 1);
+
+//     // --- Custom Kernel 1 (Warp-Centric) ---
+//     checkCuda(cudaEventRecord(start));
+//     for (int i = 0; i < iterations; ++i) {
+//         warp_centric_reduction_kernel<<<grid_dim, block_dim>>>(d_errors_col_major, d_bias_grad_warp, batch_size);
+//     }
+//     checkCuda(cudaEventRecord(stop));
+//     checkCuda(cudaEventSynchronize(stop));
+//     checkCuda(cudaEventElapsedTime(&time_ms, start, stop));
+//     std::cout << "Custom Kernel (Warp-Centric):      " << std::fixed << std::setprecision(6) << time_ms / iterations << " ms" << std::endl;
+
+//     // --- Custom Kernel 2 (__syncthreads Loop) ---
+//     checkCuda(cudaEventRecord(start));
+//     for (int i = 0; i < iterations; ++i) {
+//         syncthreads_loop_reduction_kernel<<<grid_dim, block_dim>>>(d_errors_col_major, d_bias_grad_syncloop, batch_size);
+//     }
+//     checkCuda(cudaEventRecord(stop));
+//     checkCuda(cudaEventSynchronize(stop));
+//     checkCuda(cudaEventElapsedTime(&time_ms, start, stop));
+//     std::cout << "Custom Kernel (__syncthreads Loop):" << std::fixed << std::setprecision(6) << time_ms / iterations << " ms" << std::endl;
+
+//     // --- CUB DeviceSegmentedReduce ---
+//     checkCuda(cudaEventRecord(start));
+//     for (int i = 0; i < iterations; ++i) {
+//         cub::DeviceSegmentedReduce::Sum(d_temp_storage, temp_storage_bytes, d_errors_col_major, d_bias_grad_cub, C_out, d_offsets, d_offsets + 1);
+//     }
+//     checkCuda(cudaEventRecord(stop));
+//     checkCuda(cudaEventSynchronize(stop));
+//     checkCuda(cudaEventElapsedTime(&time_ms, start, stop));
+//     std::cout << "CUB DeviceSegmentedReduce:         " << std::fixed << std::setprecision(6) << time_ms / iterations << " ms" << std::endl;
+
+//     // --- cuBLAS gemv Trick ---
+//     const float alpha = 1.0f, beta = 0.0f;
+//     checkCuda(cudaEventRecord(start));
+//     for (int i = 0; i < iterations; ++i) {
+//         checkCublas(cublasSgemv(cublas_handle, CUBLAS_OP_T, batch_size, C_out, &alpha, d_errors_col_major, batch_size, d_ones, 1, &beta, d_bias_grad_gemv, 1));
+//     }
+//     checkCuda(cudaEventRecord(stop));
+//     checkCuda(cudaEventSynchronize(stop));
+//     checkCuda(cudaEventElapsedTime(&time_ms, start, stop));
+//     std::cout << "cuBLAS gemv Trick:                 " << std::fixed << std::setprecision(6) << time_ms / iterations << " ms" << std::endl;
+//     std::cout << "------------------------------------------------------------------" << std::endl;
+
+//     // --- Verification ---
+//     std::vector<float> h_bias_warp(C_out), h_bias_syncloop(C_out), h_bias_cub(C_out);
+//     checkCuda(cudaMemcpy(h_bias_warp.data(), d_bias_grad_warp, C_out * sizeof(float), cudaMemcpyDeviceToHost));
+//     checkCuda(cudaMemcpy(h_bias_syncloop.data(), d_bias_grad_syncloop, C_out * sizeof(float), cudaMemcpyDeviceToHost));
+//     checkCuda(cudaMemcpy(h_bias_cub.data(), d_bias_grad_cub, C_out * sizeof(float), cudaMemcpyDeviceToHost));
+//     bool ok = true;
+//     for(int i = 0; i < C_out; ++i) {
+//         if (abs(h_bias_warp[i] - h_bias_syncloop[i]) > 1e-4 || abs(h_bias_warp[i] - h_bias_cub[i]) > 1e-4) {
+//             ok = false;
+//             break;
+//         }
+//     }
+//     std::cout << "Verification check: " << (ok ? "PASSED" : "FAILED") << std::endl;
+
+//     // --- Cleanup ---
+//     checkCuda(cudaFree(d_temp_storage));
+//     checkCublas(cublasDestroy(cublas_handle));
+//     checkCuda(cudaFree(d_errors_col_major));
+//     checkCuda(cudaFree(d_bias_grad_cub));
+//     checkCuda(cudaFree(d_bias_grad_gemv));
+//     checkCuda(cudaFree(d_bias_grad_warp));
+//     checkCuda(cudaFree(d_bias_grad_syncloop));
+//     checkCuda(cudaFree(d_offsets));
+//     checkCuda(cudaFree(d_ones));
+//     return 0;
+// }
+
+
+
+

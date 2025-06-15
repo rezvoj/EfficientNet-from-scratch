@@ -257,7 +257,7 @@ void depthwiseConvBackward(
  * @returns for first thread in the warp the total sum for the warp.
  */
 __forceinline__ __device__ 
-float warpReduce(float threadValue) {
+float warpReduceSum(float threadValue) {
     for (int offset = 16; offset > 0; offset /= 2) {
         threadValue += __shfl_down_sync(0xFFFFFFFF, threadValue, offset);
     }
@@ -346,7 +346,7 @@ void depthwiseConvBackwardGrad(
         }
     }
     // Warp reduce within the whole block into shared memory
-    threadValue = warpReduce(threadValue);
+    threadValue = warpReduceSum(threadValue);
     if (tInWarpIdx == 0) {
         shResults[warpInBlockIdx] = threadValue;
     }
@@ -355,7 +355,7 @@ void depthwiseConvBackwardGrad(
     if (warpInBlockIdx != 0) return;
     // Warp reduce the only first warp to get the final sum value
     threadValue = tInWarpIdx < WARPS_PER_BLOCK ? shResults[tInWarpIdx] : 0;
-    threadValue = warpReduce(threadValue);
+    threadValue = warpReduceSum(threadValue);
     // Save the final value for the whole block
     if (threadIdx.x != 0) return;
     outFilterGrads[blockIdx.x] = threadValue;
@@ -663,184 +663,14 @@ void crossEntropyLoss(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-//////////////////////// Maybe used maybe not ////////////////////////////
 __global__
-void transposeMatrix(
-        float* __restrict__ matrixOut,
-        const float* __restrict__ matrixIn,
-        const uint colSize,
-        const uint rowSize) {
-    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tIdx >= colSize * rowSize) return;
-    const uint colIdx = tIdx / rowSize;
-    const uint rowIdx = tIdx % rowSize;
-    matrixOut[tIdx] = matrixIn[rowIdx * colSize + colIdx];
-}
-
-
-template <typename Operation>
-__global__
-void rowBroadcastOpInplace(
-        float* __restrict__ outValues,
-        const float* __restrict__ inVec,
-        const uint rowSize,
+void broadcastAddBiasInplace(
+        float* __restrict__ outMatrix,
+        const float* __restrict__ inBiases,
+        const uint CSize,
         const uint size) {
     const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
     if (tIdx >= size) return;
-    const uint rowIdx = tIdx % rowSize;
-    const Operation operation;
-    outValues[tIdx] = operation(outValues[tIdx], inVec[rowIdx]);
+    const uint biasIdx = tIdx % CSize;
+    outMatrix[tIdx] += inBiases[biasIdx];
 }
-
-
-template <typename Operation>
-__global__
-void rowBroadcastOp(
-        float* __restrict__ outValues,
-        const float* __restrict__ inValues,
-        const float* __restrict__ inVec,
-        const uint rowSize,
-        const uint size) {
-    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tIdx >= size) return;
-    const uint rowIdx = tIdx % rowSize;
-    const Operation operation;
-    outValues[tIdx] = operation(inValues[tIdx], inVec[rowIdx]);
-}
-
-
-template <typename Operation>
-__global__ 
-void elementwiseOpInplace(
-        float* __restrict__ tensor, 
-        const uint size) {
-    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tIdx >= size) return;
-    const Operation operation;
-    tensor[tIdx] = operation(tensor[tIdx]);
-}
-
-
-template <typename Operation>
-__global__
-void elementwiseOp(
-        float* __restrict__ outTensor,
-        const float* __restrict__ inTensor,
-        const uint size) {
-    const uint tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= size) return;
-    const Operation operation;
-    outTensor[tid] = operation(inTensor[tid]);
-}
-
-
-template <typename Operation>
-__global__ 
-void elementwiseScalarOpInplace(
-        float* __restrict__ tensor,
-        const float value,
-        const uint size) {
-    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tIdx >= size) return;
-    const Operation operation;
-    tensor[tIdx] = operation(tensor[tIdx], value);
-}
-
-
-template <typename Operation>
-__global__
-void elementwiseScalarOp(
-        float* __restrict__ outTensor,
-        const float* __restrict__ inTensor,
-        const float value,
-        const uint size) {
-    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tIdx >= size) return;
-    const Operation operation;
-    outTensor[tIdx] = operation(inTensor[tIdx], value);
-}
-
-
-template <typename Operation>
-__global__ 
-void elementwise2TensorOpInplace(
-        float* __restrict__ toTensor, 
-        const float* __restrict__ fromTensor, 
-        const uint size) {
-    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tIdx >= size) return;
-    const Operation operation;
-    toTensor[tIdx] = operation(toTensor[tIdx], fromTensor[tIdx]);
-}
-
-
-template <typename Operation>
-__global__ 
-void elementwise2TensorOp(
-        float* __restrict__ outTensor,
-        const float* __restrict__ tensorA,
-        const float* __restrict__ tensorB, 
-        const uint size) {
-    const uint tIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tIdx >= size) return;
-    const Operation operation;
-    outTensor[tIdx] = operation(tensorA[tIdx], tensorB[tIdx]);
-}
-
-
-// template <uint TensorDim>
-// __global__
-// void reshapeTensor(
-//         float* __restrict__ tensorOut,
-//         const float* __restrict__ tensorIn,
-//         const uint outRowSize,
-//         const uint outOrder[TensorDim],
-//         const uint outDimSizeSums[TensorDim],
-//         const uint inDimSizeSums[TensorDim]) {
-//     const uint outFullIdx = blockIdx.x * blockDim.x + threadIdx.x;
-//     uint outIdxes[TensorDim];
-//     uint outCurrIdx = outFullIdx;
-//     for (uint dimIdx = 0; dimIdx < TensorDim; ++dimIdx) {
-//         const uint currentDimSizeSum = outDimSizeSums[dimIdx];
-//         outIdxes[dimIdx] = outCurrIdx / currentDimSizeSum;
-//         outCurrIdx = outCurrIdx % currentDimSizeSum;
-//     }
-//     float value = 0.0f;
-//     if (outIdxes[TensorDim - 1] < outRowSize) {
-//         uint inFullIdx = 0;
-//         for (uint dimIdx = 0; dimIdx < TensorDim; ++dimIdx) {
-//             const uint currDimIdx = outIdxes[outOrder[dimIdx]];
-//             inFullIdx += currDimIdx * inDimSizeSums[currDimIdx];
-//         }
-//         value = tensorIn[inFullIdx];
-//     }
-//     tensorOut[outFullIdx] = value;
-// }

@@ -1,6 +1,7 @@
 #pragma once
 #include <stdexcept>
 #include <cudnn.h>
+#include <cublasLt.h>
 
 
 
@@ -40,6 +41,21 @@ __forceinline__
 void checkCudnn(const cudnnStatus_t status) {
     if (status != CUDNN_STATUS_SUCCESS) {
         throw CudnnException(status);
+    }
+}
+
+
+class CublasException : public std::runtime_error {
+public:
+    CublasException(const cublasStatus_t status) :
+        std::runtime_error(cublasGetStatusString(status)) {}
+};
+
+
+__forceinline__
+void checkCublas(const cublasStatus_t status) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw CublasException(status);
     }
 }
 
