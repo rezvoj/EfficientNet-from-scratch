@@ -271,7 +271,7 @@ public:
                 optimizerAlgorithm(algorithm) {}
     
     // Initializes weights to internally spcified values
-    virtual void initWeights(const size_t seed, size_t& offset) = 0;
+    virtual void initWeights(const size_t seed) = 0;
 
     // Registers the layer's weight and weight gradient tensors
     // The registered tensors CAN'T be exchanged with other layers in memory trade
@@ -297,18 +297,20 @@ private:
     std::uniform_real_distribution<> distribution;
 
 public:
-    SplitLayer(const TensorSize inputSize, const float retainRate):
-            Layer(inputSize, inputSize),
-            partialBackward(false),
-            stochasticSkip(false),
-            retainRate(retainRate),
-            nextShortcut(nullptr),
-            nextMerge(nullptr),
-            d_oCopyTensor(nullptr),
-            randomGenerator(nullptr) {
+    SplitLayer(
+            const TensorSize inputSize,
+            const float retainRate,
+            const size_t seed):
+                Layer(inputSize, inputSize),
+                partialBackward(false),
+                stochasticSkip(false),
+                retainRate(retainRate),
+                nextShortcut(nullptr),
+                nextMerge(nullptr),
+                d_oCopyTensor(nullptr),
+                randomGenerator(nullptr) {
         if (retainRate < 1.0f) {
-            std::random_device device;
-            randomGenerator = new std::mt19937(device());
+            randomGenerator = new std::mt19937(seed);
             distribution = std::uniform_real_distribution<>(0.0, 1.0);
         }
     }
@@ -688,18 +690,18 @@ public:
         if (backOn == trainOn) return;
         backOn = trainOn;
         if (trainOn) {
-            // Recreate the dropout states the training
-            checkCuda(cudaMalloc(&d_oCudnnDropoutStates, cudnnDropoutStatesSize));
-            checkCudnn(cudnnSetDropoutDescriptor(
-                cudnnDropoutDesc, cudnnHandle, dropoutRate,
-                d_oCudnnDropoutStates, cudnnDropoutStatesSize, dropoutSeed
-            ));
+            // Create the dropout states for training if not created yet
+            if (d_oCudnnDropoutStates == nullptr) {
+                checkCuda(cudaMalloc(&d_oCudnnDropoutStates, cudnnDropoutStatesSize));
+                checkCudnn(cudnnSetDropoutDescriptor(
+                    cudnnDropoutDesc, cudnnHandle, dropoutRate,
+                    d_oCudnnDropoutStates, cudnnDropoutStatesSize, dropoutSeed
+                ));
+            }
         }
         else {
             // Free the rosources needed only for training
-            checkCuda(cudaFree(d_oCudnnDropoutStates));
             checkCuda(cudaFree(d_oCudnnReserveSpace));
-            d_oCudnnDropoutStates = nullptr;
             d_oCudnnReserveSpace = nullptr;
         }
         // Reset the batch sizes to force buffer reallocations in forward pass
@@ -1094,7 +1096,7 @@ public:
     }
 
 
-    void initWeights([[maybe_unused]] const size_t seed, [[maybe_unused]] size_t& offset) override {
+    void initWeights([[maybe_unused]] const size_t seed) override {
         // Initialize the scale, shift, running mean and variance to default values
         const dim3 gridSize(ceilDiv(outputSize.C, BLOCK_SIZE));
         initValues<<<gridSize, BLOCK_SIZE>>>(d_oScale, 1.0f, outputSize.C);
@@ -1463,16 +1465,14 @@ public:
     }
 
 
-    void initWeights(const size_t seed, size_t& offset) override {
+    void initWeights(const size_t seed) override {
         const size_t filterInSize = inputSize.C * filterSize * filterSize;
         // He-Normal initialization for the convolution filter weights
         const float range = std::sqrt(2.0f / filterInSize);
         initRandomValues<true><<<ceilDiv(filtersFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-            d_oFiltersTensor, seed, offset, range, filtersFullSize
+            d_oFiltersTensor, seed, 0, range, filtersFullSize
         );
         checkCudaLastError();
-        // Move the offset to prevent correlated random initialization
-        offset += filtersFullSize;
     }
 
 
@@ -1724,15 +1724,13 @@ public:
     }
 
 
-    void initWeights(const size_t seed, size_t& offset) override {
+    void initWeights(const size_t seed) override {
         // He-Normal initialization for the linear layer weights
         const float range = std::sqrt(2.0f / inputSize.C);
         initRandomValues<true><<<ceilDiv(weightsFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-            d_oWeightMatrix, seed, offset, range, weightsFullSize
+            d_oWeightMatrix, seed, 0, range, weightsFullSize
         );
         checkCudaLastError();
-        // Move the offset to prevent correlated random initialization
-        offset += weightsFullSize;
         // Zero initialize the biases
         initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(
             d_oBiasVector, 0.0f, outputSize.C
@@ -1908,15 +1906,13 @@ public:
     }
 
 
-    void initWeights(const size_t seed, size_t& offset) override {
+    void initWeights(const size_t seed) override {
         // He-Normal initialization for the convolution filter weights
         const float range = std::sqrt(2.0f / (FILTER_R_SIZE * FILTER_R_SIZE));
         initRandomValues<true><<<ceilDiv(filtersFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-            d_oFiltersTensor, seed, offset, range, filtersFullSize
+            d_oFiltersTensor, seed, 0, range, filtersFullSize
         );
         checkCudaLastError();
-        // Move the offset to prevent correlated random initialization
-        offset += filtersFullSize;
     }
 
 
