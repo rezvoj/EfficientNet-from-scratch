@@ -9,16 +9,28 @@
 #include "../layers/Regularization.cuh"
 #include "../layers/Resizing.cuh"
 #include "../layers/SplitMerge.cuh"
-#include "../network/Optimizer.cuh"
 #include "../utils/Math.cuh"
+#include "Optimizer.cuh"
+
+
+
+class IMBConvBlock {
+public:
+    virtual void connect(Layer* nextLayer) = 0;
+    virtual Layer* getFirstLayer() = 0;
+    virtual void toggleTrain(const bool trainOn) = 0;
+    virtual void initWeights() = 0;
+    virtual void registerWeights(Optimizer& optimizer) = 0;
+    virtual void reRegisterGrads(Optimizer& optimizer) = 0;
+    virtual ~IMBConvBlock() = default;
+};
 
 
 
 template <uint FILTER_SIZE, uint STRIDE>
-class MBConvBlock {
+class MBConvBlock : public IMBConvBlock {
 private:
     std::vector<Layer*> allLayers;
-    std::vector<LearnableLayer*> learnableLayers;
     Layer *firstLayer, *lastLayer;
     std::mt19937* randomGenerator;
 
@@ -42,13 +54,12 @@ public:
         auto depthwiseBN = new BatchNormLayer(depthwiseOutputSize, expAvgFactor, epsilon, Optimizer::ADAM, cudnnHandle);
         auto depthwiseSiLU = new ActivationLayer<SiLU>(depthwiseOutputSize);
         // Save and connect the depthwise convolution layers
-        learnableLayers.insert(learnableLayers.end(), {depthwiseConv, depthwiseBN});
         allLayers.insert(allLayers.end(), {depthwiseConv, depthwiseBN, depthwiseSiLU});
         depthwiseConv->connect(depthwiseBN->connect(depthwiseSiLU));
         // Squeeze-excitation block layers
         auto seSplit = new SplitLayer(depthwiseOutputSize, 1.0f, (*randomGenerator)());
         auto seFlatten = new AvgPoolingFlattenLayer(depthwiseOutputSize, cudnnHandle);
-        const uint seSqueezedChannels = std::max(1UL, inputSize.C / inverseSERatio);
+        const uint seSqueezedChannels = std::max(1U, inputSize.C / inverseSERatio);
         auto seBottleneck = new LinearLayer(depthwiseOutputSize.C, seSqueezedChannels, false, Optimizer::ADAM_W, cublasHandle);
         auto seSiLU = new ActivationLayer<SiLU>(TensorSize{seSqueezedChannels, 1, 1});
         auto seLinearOut = new LinearLayer(seSqueezedChannels, depthwiseOutputSize.C, false, Optimizer::ADAM_W, cublasHandle);
@@ -56,7 +67,6 @@ public:
         auto seExpansion = new ExpansionLayer(depthwiseOutputSize, cudnnHandle);
         auto seMulMerge = new MulMergeLayer(depthwiseOutputSize);
         // Connect and save the squeeze-excitation block layers
-        learnableLayers.insert(learnableLayers.end(), {seBottleneck, seLinearOut});
         allLayers.insert(allLayers.end(), {seSplit, seFlatten, seBottleneck, seSiLU, seLinearOut, seSigmoid, seExpansion, seMulMerge});
         depthwiseSiLU->connect(seSplit->connect(seFlatten->connect(seBottleneck)));
         seBottleneck->connect(seSiLU->connect(seLinearOut->connect(seSigmoid->connect(seExpansion))));
@@ -68,7 +78,6 @@ public:
         const TensorSize shrinkConvOutputSize = {outChannels, depthwiseOutputSize.H, depthwiseOutputSize.W};
         auto shrinkBN = new BatchNormLayer(shrinkConvOutputSize, expAvgFactor, epsilon, Optimizer::ADAM, cudnnHandle);
         // Connect and save the shrinking convolution layers
-        learnableLayers.insert(learnableLayers.end(), {shrink, shrinkBN});
         allLayers.insert(allLayers.end(), {shrink, shrinkBN});
         seMulMerge->connect(shrink->connect(shrinkBN));
         // Set defualt first and last layers
@@ -80,7 +89,6 @@ public:
             auto expBN = new BatchNormLayer(expandConvInputSize, expAvgFactor, epsilon, Optimizer::ADAM, cudnnHandle);
             auto expSiLU = new ActivationLayer<SiLU>(expandConvInputSize);
             // Connect and save the expansion convolution layers
-            learnableLayers.insert(learnableLayers.end(), {expConv, expBN});
             allLayers.insert(allLayers.end(), {expConv, expBN, expSiLU});
             expConv->connect(expBN->connect(expSiLU->connect(firstLayer)));
             firstLayer = expConv;
@@ -113,24 +121,31 @@ public:
     
 
     void initWeights() {
-        for (LearnableLayer* layer : learnableLayers) { 
-            layer->initWeights((*randomGenerator)());
+        for (Layer* layer : allLayers) {
+            if (LearnableLayer* learnable = dynamic_cast<LearnableLayer*>(layer)) {
+                learnable->initWeights((*randomGenerator)());
+            }
         }
     }
 
 
     void registerWeights(Optimizer& optimizer) {
-        for (LearnableLayer* layer : learnableLayers) { 
-            layer->registerWeights(optimizer);
+        for (Layer* layer : allLayers) {
+            if (LearnableLayer* learnable = dynamic_cast<LearnableLayer*>(layer)) {
+                learnable->registerWeights(optimizer);
+            }
         }
     }
 
 
     void reRegisterGrads(Optimizer& optimizer) {
-        for (LearnableLayer* layer : learnableLayers) {
-            layer->reRegisterGrads(optimizer);
+        for (Layer* layer : allLayers) {
+            if (LearnableLayer* learnable = dynamic_cast<LearnableLayer*>(layer)) {
+                learnable->reRegisterGrads(optimizer);
+            }
         }
     }
+
 
     ~MBConvBlock() {
         delete randomGenerator;
