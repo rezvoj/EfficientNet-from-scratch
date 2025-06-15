@@ -56,32 +56,38 @@ public:
         // Save and connect the depthwise convolution layers
         allLayers.insert(allLayers.end(), {depthwiseConv, depthwiseBN, depthwiseSiLU});
         depthwiseConv->connect(depthwiseBN->connect(depthwiseSiLU));
-        // Squeeze-excitation block layers
-        auto seSplit = new SplitLayer(depthwiseOutputSize, 1.0f, (*randomGenerator)());
-        auto seFlatten = new AvgPoolingFlattenLayer(depthwiseOutputSize, cudnnHandle);
-        const uint seSqueezedChannels = std::max(1U, inputSize.C / inverseSERatio);
-        auto seBottleneck = new LinearLayer(depthwiseOutputSize.C, seSqueezedChannels, false, Optimizer::ADAM_W, cublasHandle);
-        auto seSiLU = new ActivationLayer<SiLU>(TensorSize{seSqueezedChannels, 1, 1});
-        auto seLinearOut = new LinearLayer(seSqueezedChannels, depthwiseOutputSize.C, false, Optimizer::ADAM_W, cublasHandle);
-        auto seSigmoid = new ActivationLayer<Sigmoid>(TensorSize{depthwiseOutputSize.C, 1, 1});
-        auto seExpansion = new ExpansionLayer(depthwiseOutputSize, cudnnHandle);
-        auto seMulMerge = new MulMergeLayer(depthwiseOutputSize);
-        // Connect and save the squeeze-excitation block layers
-        allLayers.insert(allLayers.end(), {seSplit, seFlatten, seBottleneck, seSiLU, seLinearOut, seSigmoid, seExpansion, seMulMerge});
-        depthwiseSiLU->connect(seSplit->connect(seFlatten->connect(seBottleneck)));
-        seBottleneck->connect(seSiLU->connect(seLinearOut->connect(seSigmoid->connect(seExpansion))));
-        seMulMerge->setPrevFull(seExpansion);
-        seMulMerge->setPrevSplit(seSplit);
-        seSplit->connectShortcut(seMulMerge);
+        // Set current first and last layers
+        firstLayer = depthwiseConv;
+        lastLayer = depthwiseSiLU;
+        // Conditionally add squeeze-excitation block layers
+        if (inverseSERatio != 0) {
+            auto seSplit = new SplitLayer(depthwiseOutputSize, 1.0f, (*randomGenerator)());
+            auto seFlatten = new AvgPoolingFlattenLayer(depthwiseOutputSize, cudnnHandle);
+            const uint seSqueezedChannels = std::max(1U, depthwiseOutputSize.C / inverseSERatio);
+            auto seBottleneck = new LinearLayer(depthwiseOutputSize.C, seSqueezedChannels, false, Optimizer::ADAM_W, cublasHandle);
+            auto seSiLU = new ActivationLayer<SiLU>(TensorSize{seSqueezedChannels, 1, 1});
+            auto seLinearOut = new LinearLayer(seSqueezedChannels, depthwiseOutputSize.C, false, Optimizer::ADAM_W, cublasHandle);
+            auto seSigmoid = new ActivationLayer<Sigmoid>(TensorSize{depthwiseOutputSize.C, 1, 1});
+            auto seExpansion = new ExpansionLayer(depthwiseOutputSize, cudnnHandle);
+            auto seMulMerge = new MulMergeLayer(depthwiseOutputSize);
+            // Connect and save the squeeze-excitation block layers
+            allLayers.insert(allLayers.end(), {seSplit, seFlatten, seBottleneck, seSiLU, seLinearOut, seSigmoid, seExpansion, seMulMerge});
+            lastLayer->connect(seSplit->connect(seFlatten->connect(seBottleneck)));
+            seBottleneck->connect(seSiLU->connect(seLinearOut->connect(seSigmoid->connect(seExpansion))));
+            seMulMerge->setPrevFull(seExpansion);
+            seMulMerge->setPrevSplit(seSplit);
+            seSplit->connectShortcut(seMulMerge);
+            // Set current last layer
+            lastLayer = seMulMerge;
+        }
         // Shrinking convolution layers
         auto shrink = new ConvolutionLayer(depthwiseOutputSize, outChannels, 1, 1, false, Optimizer::ADAM_W, cudnnHandle);
         const TensorSize shrinkConvOutputSize = {outChannels, depthwiseOutputSize.H, depthwiseOutputSize.W};
         auto shrinkBN = new BatchNormLayer(shrinkConvOutputSize, expAvgFactor, epsilon, Optimizer::ADAM, cudnnHandle);
         // Connect and save the shrinking convolution layers
         allLayers.insert(allLayers.end(), {shrink, shrinkBN});
-        seMulMerge->connect(shrink->connect(shrinkBN));
-        // Set defualt first and last layers
-        firstLayer = depthwiseConv;
+        lastLayer->connect(shrink->connect(shrinkBN));
+        // Set current last layer
         lastLayer = shrinkBN;
         // Conditionally add the expansion convolution layers
         if (expandRatio > 1) {
@@ -91,6 +97,7 @@ public:
             // Connect and save the expansion convolution layers
             allLayers.insert(allLayers.end(), {expConv, expBN, expSiLU});
             expConv->connect(expBN->connect(expSiLU->connect(firstLayer)));
+            // Set current last layer
             firstLayer = expConv;
         }
         // Conditionally add the residual skip layers
@@ -103,6 +110,7 @@ public:
             resAddMerge->setPrevFull(lastLayer);
             resAddMerge->setPrevSplit(resSplit);
             resSplit->connectShortcut(resAddMerge);
+            // Set final first and last layers
             firstLayer = resSplit;
             lastLayer = resAddMerge;
         }

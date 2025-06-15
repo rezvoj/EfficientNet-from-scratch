@@ -10,6 +10,56 @@ constexpr uint BLOCK_SIZE = 256;
 
 
 
+class InputLayer : public Layer {
+private:
+    float* d_oOutTensor;
+    
+public:
+    InputLayer(const TensorSize outputSize):
+            Layer(outputSize, outputSize),
+            d_oOutTensor(nullptr) {}
+
+    
+    // Use start forward with host inputs instead of forward
+    void forward(float* d_inputTensor, const uint batchSize) override {}
+    
+
+    // Copies the host input tensor to device and starts the forward pass chain
+    void startForward(const float* inputTensor, const uint batchSize) {
+        const uint fullSize = batchSize * outputSize.fullSize();
+        // Reallocate memory only if it's actual size is smaller
+        if (currActualBatchSize < batchSize) {
+            currActualBatchSize = batchSize;
+            checkCuda(cudaFree(d_oOutTensor));
+            checkCuda(cudaMalloc(&d_oOutTensor, fullSize * sizeof(float)));
+        }
+        // Copy the input host tensor into the layer's owned output tensor
+        checkCuda(cudaMemcpy(
+            d_oOutTensor, inputTensor, 
+            fullSize * sizeof(float),
+            cudaMemcpyHostToDevice
+        ));
+        // Lend the output tensor with the loaded host data to the next layer
+        next->forward(d_oOutTensor, batchSize);
+    }
+
+
+    void backward(float* d_gradientTensor) override {
+        // Reclaim the given back output tensor buffer to complete the memory trade
+        d_oOutTensor = d_gradientTensor;
+    }
+
+
+    ~InputLayer() override {
+        if (!std::uncaught_exceptions()) {
+            checkCuda(cudaFree(d_oOutTensor));
+        }
+    }
+
+};
+
+
+
 class SoftmaxLossLayer : public Layer {
 private:
     float epsilon;
@@ -22,8 +72,8 @@ private:
 public:
     SoftmaxLossLayer(
             const TensorSize inputSize,
-            const cudnnHandle_t handle,
-            const float epsilon):
+            const float epsilon,
+            const cudnnHandle_t handle):
                 Layer(inputSize, inputSize),
                 epsilon(epsilon),
                 d_oLabelValues(nullptr),
@@ -75,10 +125,11 @@ public:
     }
 
 
-    // Fills the host buffer with the calculated probabilities
-    // Only valid before starting backprop
-    // Deeply assumes that the maximal label is less then number of categories
-    void getHostBatchLoss(float* batchLoss, uint* trueLabels) {
+    // Fills the internal buffer with provided label values
+    // Fills the host buffer with the calculated loss values
+    // Only valid before starting backprop and maximal label 
+    //  has to be lower then number of categories
+    void getHostBatchLoss(float* batchLoss, const uint* trueLabels) {
         // Copy labels to device
         checkCuda(cudaMemcpy(
             d_oLabelValues, trueLabels, 
@@ -101,14 +152,16 @@ public:
 
 
     // Starts the backprop chain taking and calculates the batch corss entropy loss
-    void startBackward(uint* trueLabels) {
+    void startBackward(const uint* trueLabels) {
         if (!backOn) return;
-        // Copy labels to device
-        checkCuda(cudaMemcpy(
-            d_oLabelValues, trueLabels, 
-            currBatchSize * sizeof(uint),
-            cudaMemcpyHostToDevice
-        ));
+        // Copy labels to device, on null assume already copied
+        if (trueLabels != nullptr) {
+            checkCuda(cudaMemcpy(
+                d_oLabelValues, trueLabels, 
+                currBatchSize * sizeof(uint),
+                cudaMemcpyHostToDevice
+            ));
+        }
         // Calculate loss gradients into the borrowed input tensor
         const uint fullSize = currBatchSize * inputSize.C;
         crossEntropyLossGradInplace<<<ceilDiv(fullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
@@ -124,56 +177,6 @@ public:
         checkCuda(cudaFree(d_oLabelValues));
         checkCuda(cudaFree(d_oLossValues));
         checkCudnn(cudnnDestroyTensorDescriptor(cudnnTensorDesc));
-    }
-
-};
-
-
-
-class InputLayer : public Layer {
-private:
-    float* d_oOutTensor;
-    
-public:
-    InputLayer(const TensorSize outputSize):
-            Layer(outputSize, outputSize),
-            d_oOutTensor(nullptr) {}
-
-    
-    // Use start forward with host inputs instead of forward
-    void forward(float* d_inputTensor, const uint batchSize) override {}
-    
-
-    // Copies the host input tensor to device and starts the forward pass chain
-    void startForward(float* inputTensor, const uint batchSize) {
-        const uint fullSize = batchSize * outputSize.fullSize();
-        // Reallocate memory only if it's actual size is smaller
-        if (currActualBatchSize < batchSize) {
-            currActualBatchSize = batchSize;
-            checkCuda(cudaFree(d_oOutTensor));
-            checkCuda(cudaMalloc(&d_oOutTensor, fullSize * sizeof(float)));
-        }
-        // Copy the input host tensor into the layer's owned output tensor
-        checkCuda(cudaMemcpy(
-            d_oOutTensor, inputTensor, 
-            fullSize * sizeof(float),
-            cudaMemcpyHostToDevice
-        ));
-        // Lend the output tensor with the loaded host data to the next layer
-        next->forward(d_oOutTensor, batchSize);
-    }
-
-
-    void backward(float* d_gradientTensor) override {
-        // Reclaim the given back output tensor buffer to complete the memory trade
-        d_oOutTensor = d_gradientTensor;
-    }
-
-
-    ~InputLayer() override {
-        if (!std::uncaught_exceptions()) {
-            checkCuda(cudaFree(d_oOutTensor));
-        }
     }
 
 };
