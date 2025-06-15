@@ -21,6 +21,7 @@ void referenceDepthwiseConv(
         const int inWSize,
         const int outHSize, 
         const int outWSize) {
+    // Calculate padding and tensor strides
     const int padHIdx = (FILTER_SIZE - 1) / 2;
     const int padWIdx = (FILTER_SIZE - 1) / 2;
     const int inStrideBIdx = CSize * inHSize * inWSize;
@@ -28,15 +29,19 @@ void referenceDepthwiseConv(
     const int outStrideBIdx = CSize * outHSize * outWSize;
     const int outStrideCIdx = outHSize * outWSize;
     const int filterStrideCIdx = FILTER_SIZE * FILTER_SIZE;
+    // Iterate over each output element to compute its value
     for (int batchIdx = 0; batchIdx < BSize; ++batchIdx) {
         for (int channelIdx = 0; channelIdx < CSize; ++channelIdx) {
             for (int outHIdx = 0; outHIdx < outHSize; ++outHIdx) {
                 for (int outWIdx = 0; outWIdx < outWSize; ++outWIdx) {
+                    // Compute the convolution sum for one output element
                     float sum = 0.0f;
                     for (int filterHIdx = 0; filterHIdx < FILTER_SIZE; ++filterHIdx) {
                         for (int filterWIdx = 0; filterWIdx < FILTER_SIZE; ++filterWIdx) {
+                            // Map output coordinates to input coordinates
                             const int inHIdx = outHIdx * STRIDE + filterHIdx - padHIdx;
                             const int inWIdx = outWIdx * STRIDE + filterWIdx - padWIdx;
+                            // Accumulate sum, applying zero-padding implicitly
                             if (inHIdx >= 0 && inHIdx < inHSize && inWIdx >= 0 && inWIdx < inWSize) {
                                 const int inTensorIdx = batchIdx * inStrideBIdx 
                                     + channelIdx * inStrideCIdx 
@@ -47,6 +52,7 @@ void referenceDepthwiseConv(
                             }
                         }
                     }
+                    // Store the final computed value
                     const int outTensorIdx = batchIdx * outStrideBIdx 
                         + channelIdx * outStrideCIdx 
                         + outHIdx * outWSize + outWIdx;
@@ -61,44 +67,52 @@ void referenceDepthwiseConv(
 
 template <int FILTER_SIZE, int STRIDE>
 void referenceDepthwiseConvBackward(
-        float* outTensor,
-        const float* inTensor,
-        const float* inFilters,
+        float* inputGradTensor,
+        const float* outputGradTensor,
+        const float* filtersTensor,
         const int BSize,
         const int CSize,
         const int inHSize,
         const int inWSize,
         const int outHSize,
         const int outWSize) {
+    // Calculate padding and tensor strides
     const int padHIdx = (FILTER_SIZE - 1) / 2;
     const int padWIdx = (FILTER_SIZE - 1) / 2;
-    const int outStrideBIdx = CSize * inHSize * inWSize;
-    const int outStrideCIdx = inHSize * inWSize;
-    const int inStrideBIdx = CSize * outHSize * outWSize;
-    const int inStrideCIdx = outHSize * outWSize;
+    const int inputGradStrideBIdx = CSize * inHSize * inWSize;
+    const int inputGradStrideCIdx = inHSize * inWSize;
+    const int outputGradStrideBIdx = CSize * outHSize * outWSize;
+    const int outputGradStrideCIdx = outHSize * outWSize;
     const int filterStrideCIdx = FILTER_SIZE * FILTER_SIZE;
+    // Zero-out the input gradient tensor before accumulation
     for (int i = 0; i < BSize * CSize * inHSize * inWSize; ++i) {
-        outTensor[i] = 0.0f;
+        inputGradTensor[i] = 0.0f;
     }
+    // Iterate over each output gradient to scatter its contribution
     for (int batchIdx = 0; batchIdx < BSize; ++batchIdx) {
         for (int channelIdx = 0; channelIdx < CSize; ++channelIdx) {
             for (int outHIdx = 0; outHIdx < outHSize; ++outHIdx) {
                 for (int outWIdx = 0; outWIdx < outWSize; ++outWIdx) {
-                    const int inTensorIdx = batchIdx * inStrideBIdx
-                        + channelIdx * inStrideCIdx
+                    // Get the current output gradient value
+                    const int outputGradIdx = batchIdx * outputGradStrideBIdx
+                        + channelIdx * outputGradStrideCIdx
                         + outHIdx * outWSize + outWIdx;
-                    const float inVal = inTensor[inTensorIdx];
+                    const float outputGradVal = outputGradTensor[outputGradIdx];
+                    // Apply the filter to scatter the gradient
                     for (int filterHIdx = 0; filterHIdx < FILTER_SIZE; ++filterHIdx) {
                         for (int filterWIdx = 0; filterWIdx < FILTER_SIZE; ++filterWIdx) {
+                            // Map output coordinates to input coordinates
                             const int inHIdx = outHIdx * STRIDE + filterHIdx - padHIdx;
                             const int inWIdx = outWIdx * STRIDE + filterWIdx - padWIdx;
+                            // Accumulate gradient, applying zero-padding implicitly
                             if (inHIdx >= 0 && inHIdx < inHSize && inWIdx >= 0 && inWIdx < inWSize) {
                                 const int filterIdx = channelIdx * filterStrideCIdx
                                     + filterHIdx * FILTER_SIZE + filterWIdx;
-                                const float filterVal = inFilters[filterIdx];
-                                const int outTensorIdx = batchIdx * outStrideBIdx + channelIdx * outStrideCIdx
+                                const float filterVal = filtersTensor[filterIdx];
+                                const int inputGradIdx = batchIdx * inputGradStrideBIdx 
+                                    + channelIdx * inputGradStrideCIdx
                                     + inHIdx * inWSize + inWIdx;
-                                outTensor[outTensorIdx] += inVal * filterVal;
+                                inputGradTensor[inputGradIdx] += outputGradVal * filterVal;
                             }
                         }
                     }
@@ -121,6 +135,7 @@ void referenceDepthwiseConvBackwardGrad(
         const int inWSize,
         const int outHSize,
         const int outWSize) {
+    // Calculate padding and tensor strides
     const int padHIdx = (FILTER_SIZE - 1) / 2;
     const int padWIdx = (FILTER_SIZE - 1) / 2;
     const int inStrideBIdx = CSize * inHSize * inWSize;
@@ -128,18 +143,23 @@ void referenceDepthwiseConvBackwardGrad(
     const int outputGradStrideBIdx = CSize * outHSize * outWSize;
     const int outputGradStrideCIdx = outHSize * outWSize;
     const int filterGradStrideCIdx = FILTER_SIZE * FILTER_SIZE;
+    // Zero-out the filter gradient tensor before accumulation
     for (int i = 0; i < CSize * FILTER_SIZE * FILTER_SIZE; ++i) {
         filterGradTensor[i] = 0.0f;
     }
+    // Iterate over each filter weight to compute its gradient
     for (int channelIdx = 0; channelIdx < CSize; ++channelIdx) {
         for (int filterHIdx = 0; filterHIdx < FILTER_SIZE; ++filterHIdx) {
             for (int filterWIdx = 0; filterWIdx < FILTER_SIZE; ++filterWIdx) {
+                // Sum the gradient contribution from all batches and positions
                 float gradientSum = 0.0f;
                 for (int batchIdx = 0; batchIdx < BSize; ++batchIdx) {
                     for (int outHIdx = 0; outHIdx < outHSize; ++outHIdx) {
                         for (int outWIdx = 0; outWIdx < outWSize; ++outWIdx) {
+                            // Map output coordinates to input coordinates
                             const int inHIdx = outHIdx * STRIDE + filterHIdx - padHIdx;
                             const int inWIdx = outWIdx * STRIDE + filterWIdx - padWIdx;
+                            // Accumulate gradient, applying zero-padding implicitly
                             if (inHIdx >= 0 && inHIdx < inHSize && inWIdx >= 0 && inWIdx < inWSize) {
                                 const int inTensorIdx = batchIdx * inStrideBIdx
                                     + channelIdx * inStrideCIdx
@@ -154,6 +174,7 @@ void referenceDepthwiseConvBackwardGrad(
                         }
                     }
                 }
+                // Store the final computed gradient for the filter weight
                 const int filterGradTensorIdx = channelIdx * filterGradStrideCIdx
                     + filterHIdx * FILTER_SIZE + filterWIdx;
                 filterGradTensor[filterGradTensorIdx] = gradientSum;
@@ -276,50 +297,50 @@ bool depthwiseConvBackwardTest(const TestParams& params) {
     // Calculate output dimensions and tensor sizes
     const int outHSize = ceilDiv(inHSize, STRIDE);
     const int outWSize = ceilDiv(inWSize, STRIDE);
-    const int dLoss_dI_size = BSize * CSize * inHSize * inWSize;
-    const int dLoss_dO_size = BSize * CSize * outHSize * outWSize;
-    const int filtersSize = CSize * FILTER_SIZE * FILTER_SIZE;
+    const int inputGradTensorSize = BSize * CSize * inHSize * inWSize;
+    const int outputGradTensorSize = BSize * CSize * outHSize * outWSize;
+    const int filtersTensorSize = CSize * FILTER_SIZE * FILTER_SIZE;
     // Allocate and initialize host memory with random values
-    float* h_dLoss_dO = new float[dLoss_dO_size];
-    float* h_filters = new float[filtersSize];
-    float* h_dLoss_dI_CPU = new float[dLoss_dI_size];
-    float* h_dLoss_dI_GPU = new float[dLoss_dI_size];
-    for (int i = 0; i < dLoss_dO_size; ++i) h_dLoss_dO[i] = static_cast<float>(rand() % 10 - 5);
-    for (int i = 0; i < filtersSize; ++i) h_filters[i] = static_cast<float>(rand() % 5 - 2);
+    float* h_outputGradTensor = new float[outputGradTensorSize];
+    float* h_filtersTensor = new float[filtersTensorSize];
+    float* h_inputGradTensor_CPU = new float[inputGradTensorSize];
+    float* h_inputGradTensor_GPU = new float[inputGradTensorSize];
+    for (int i = 0; i < outputGradTensorSize; ++i) h_outputGradTensor[i] = static_cast<float>(rand() % 10 - 5);
+    for (int i = 0; i < filtersTensorSize; ++i) h_filtersTensor[i] = static_cast<float>(rand() % 5 - 2);
     // Allocate and copy data to device memory
-    float *d_dLoss_dO, *d_filters, *d_dLoss_dI;
-    checkCuda(cudaMalloc(&d_dLoss_dO, dLoss_dO_size * sizeof(float)));
-    checkCuda(cudaMalloc(&d_filters, filtersSize * sizeof(float)));
-    checkCuda(cudaMalloc(&d_dLoss_dI, dLoss_dI_size * sizeof(float)));
-    checkCuda(cudaMemcpy(d_dLoss_dO, h_dLoss_dO, dLoss_dO_size * sizeof(float), cudaMemcpyHostToDevice));
-    checkCuda(cudaMemcpy(d_filters, h_filters, filtersSize * sizeof(float), cudaMemcpyHostToDevice));
-    checkCuda(cudaMemset(d_dLoss_dI, 0, dLoss_dI_size * sizeof(float)));
+    float *d_outputGradTensor, *d_filtersTensor, *d_inputGradTensor;
+    checkCuda(cudaMalloc(&d_outputGradTensor, outputGradTensorSize * sizeof(float)));
+    checkCuda(cudaMalloc(&d_filtersTensor, filtersTensorSize * sizeof(float)));
+    checkCuda(cudaMalloc(&d_inputGradTensor, inputGradTensorSize * sizeof(float)));
+    checkCuda(cudaMemcpy(d_outputGradTensor, h_outputGradTensor, outputGradTensorSize * sizeof(float), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(d_filtersTensor, h_filtersTensor, filtersTensorSize * sizeof(float), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemset(d_inputGradTensor, 0, inputGradTensorSize * sizeof(float)));
     // Configure CUDA kernel launch parameters
-    const int outHBlocks = ceilDiv(inHSize, BLOCK_Y_SIZE);
-    const dim3 gridDim(ceilDiv(inWSize, BLOCK_X_SIZE), BSize * CSize * outHBlocks);
+    const int inHBlocks = ceilDiv(inHSize, BLOCK_Y_SIZE);
+    const dim3 gridDim(ceilDiv(inWSize, BLOCK_X_SIZE), BSize * CSize * inHBlocks);
     const dim3 blockDim(BLOCK_X_SIZE, BLOCK_Y_SIZE);
     // Launch CUDA kernel and copy back to host
     depthwiseConvBackward<BLOCK_X_SIZE, BLOCK_Y_SIZE, FILTER_SIZE, STRIDE><<<gridDim, blockDim>>>(
-        d_dLoss_dI, d_dLoss_dO, d_filters, 
+        d_inputGradTensor, d_outputGradTensor, d_filtersTensor, 
         CSize, inHSize, inWSize, 
-        outHBlocks, outHSize, outWSize
+        inHBlocks, outHSize, outWSize
     );
     checkCudaLastError();
-    checkCuda(cudaMemcpy(h_dLoss_dI_GPU, d_dLoss_dI, dLoss_dI_size * sizeof(float), cudaMemcpyDeviceToHost));
+    checkCuda(cudaMemcpy(h_inputGradTensor_GPU, d_inputGradTensor, inputGradTensorSize * sizeof(float), cudaMemcpyDeviceToHost));
     // Run reference depthwise convolution backward implementation
     referenceDepthwiseConvBackward<FILTER_SIZE, STRIDE>(
-        h_dLoss_dI_CPU, h_dLoss_dO, h_filters,
+        h_inputGradTensor_CPU, h_outputGradTensor, h_filtersTensor,
         BSize, CSize,
         inHSize, inWSize,
         outHSize, outWSize
     );
     // Validate results by comparing reference CPU and GPU outputs
     bool success = true;
-    for (int i = 0; i < dLoss_dI_size; ++i) {
-        if (std::abs(h_dLoss_dI_CPU[i] - h_dLoss_dI_GPU[i]) > 1e-4) {
+    for (int i = 0; i < inputGradTensorSize; ++i) {
+        if (std::abs(h_inputGradTensor_CPU[i] - h_inputGradTensor_GPU[i]) > 1e-4) {
             std::cerr << "  [FAIL] Mismatch at index " << i;
-            std::cerr << "! CPU: " << h_dLoss_dI_CPU[i];
-            std::cerr << ", GPU: " << h_dLoss_dI_GPU[i] << std::endl;
+            std::cerr << "! CPU: " << h_inputGradTensor_CPU[i];
+            std::cerr << ", GPU: " << h_inputGradTensor_GPU[i] << std::endl;
             success = false;
             break;
         }
@@ -328,13 +349,13 @@ bool depthwiseConvBackwardTest(const TestParams& params) {
     if (success) {
         std::cout << "[PASS]" << std::endl;
     }
-    delete[] h_dLoss_dO;
-    delete[] h_filters;
-    delete[] h_dLoss_dI_CPU;
-    delete[] h_dLoss_dI_GPU;
-    checkCuda(cudaFree(d_dLoss_dO));
-    checkCuda(cudaFree(d_filters));
-    checkCuda(cudaFree(d_dLoss_dI));
+    delete[] h_outputGradTensor;
+    delete[] h_filtersTensor;
+    delete[] h_inputGradTensor_CPU;
+    delete[] h_inputGradTensor_GPU;
+    checkCuda(cudaFree(d_outputGradTensor));
+    checkCuda(cudaFree(d_filtersTensor));
+    checkCuda(cudaFree(d_inputGradTensor));
     return success;
 }
 

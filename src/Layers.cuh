@@ -61,9 +61,10 @@ private:
             this->tensorFullSize = tensorFullSize; 
             checkCuda(cudaMalloc(&d_oMMomentTensor, tensorFullSize * sizeof(float)));
             checkCuda(cudaMalloc(&d_oVMomentTensor, tensorFullSize * sizeof(float)));
-            initValues<<<ceilDiv(tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_oMMomentTensor, 0.0f, tensorFullSize);
+            const dim3 gridSize(ceilDiv(tensorFullSize, BLOCK_SIZE));
+            initValues<<<gridSize, BLOCK_SIZE>>>(d_oMMomentTensor, 0.0f, tensorFullSize);
             checkCudaLastError();
-            initValues<<<ceilDiv(tensorFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(d_oVMomentTensor, 0.0f, tensorFullSize);
+            initValues<<<gridSize, BLOCK_SIZE>>>(d_oVMomentTensor, 0.0f, tensorFullSize);
             checkCudaLastError();
         }        
     };
@@ -230,13 +231,12 @@ public:
     
     // Changes the layer from training to inference mode and vice versa
     // Allocating and freeing buffers which are / are not needed
-    virtual void toggleTrain([[maybe_unused]] const bool trainOn) {
-        if (backOn != trainOn) {
-            backOn = trainOn;
-            // Reset the batch sizes to force buffer reallocations
-            currBatchSize = 0;
-            currActualBatchSize = 0;
-        }
+    virtual void toggleTrain(const bool trainOn) {
+        if (backOn == trainOn) return;
+        backOn = trainOn;
+        // Reset the batch sizes to force buffer reallocations
+        currBatchSize = 0;
+        currActualBatchSize = 0;
     }
     
     // Performs forward pass calculation for the current layer
@@ -547,17 +547,16 @@ public:
 
 
     void toggleTrain(const bool trainOn) override {
-        if (backOn != trainOn) {
-            backOn = trainOn;
-            // Reset the batch sizes to force buffer reallocations
-            currBatchSize = 0;
-            currActualBatchSize = 0;
+        if (backOn == trainOn) return;
+        backOn = trainOn;
+        if (!trainOn) {
             // Free the unnecessary memory for inference
-            if (!trainOn) {
-                checkCuda(cudaFree(d_oOutTensor));
-                d_oOutTensor = nullptr;
-            }
+            checkCuda(cudaFree(d_oOutTensor));
+            d_oOutTensor = nullptr;
         }
+        // Reset the batch sizes to force buffer reallocations
+        currBatchSize = 0;
+        currActualBatchSize = 0;
     }
 
 
@@ -683,8 +682,9 @@ public:
 
 
     void toggleTrain(const bool trainOn) override {
-        if (!backOn && trainOn) {
-            backOn = true;
+        if (backOn == trainOn) return;
+        backOn = trainOn;
+        if (trainOn) {
             // Recreate the dropout states the training
             checkCuda(cudaMalloc(&d_oCudnnDropoutStates, cudnnDropoutStatesSize));
             checkCudnn(cudnnSetDropoutDescriptor(
@@ -692,8 +692,7 @@ public:
                 d_oCudnnDropoutStates, cudnnDropoutStatesSize, dropoutSeed
             ));
         }
-        else if (backOn && !trainOn) {
-            backOn = false;
+        else {
             // Free the rosources needed only for training
             checkCuda(cudaFree(d_oCudnnDropoutStates));
             checkCuda(cudaFree(d_oCudnnReserveSpace));
@@ -701,11 +700,9 @@ public:
             d_oCudnnReserveSpace = nullptr;
         }
         // Reset the batch sizes to force buffer reallocations in forward pass
-        if (backOn != trainOn) {
-            cudnnReserveSpaceSize = 0;
-            currBatchSize = 0;
-            currActualBatchSize = 0;
-        }
+        cudnnReserveSpaceSize = 0;
+        currBatchSize = 0;
+        currActualBatchSize = 0;
     }
 
 
@@ -777,18 +774,16 @@ public:
 
 
     void toggleTrain(const bool trainOn) override {
-        if (!backOn && trainOn) backOn = true;
-        else if (backOn && !trainOn) {
-            backOn = false;
+        if (backOn == trainOn) return;
+        backOn = trainOn;
+        if (!trainOn) {
             // Free the buffer only needed during training
             checkCuda(cudaFree(d_oSavedTensor));
             d_oSavedTensor = nullptr;
         }
         // Reset the batch sizes to force buffer reallocations in forward pass
-        if (backOn != trainOn) {
-            currBatchSize = 0;
-            currActualBatchSize = 0;
-        }
+        currBatchSize = 0;
+        currActualBatchSize = 0;
     }
 
 
@@ -1065,16 +1060,16 @@ public:
 
 
     void toggleTrain(const bool trainOn) override {
-        if (!backOn && trainOn) {
-            backOn = true;
+        if (backOn == trainOn) return;
+        backOn = trainOn;
+        if (trainOn) {
             // Allocate resources independant on batch size
             checkCuda(cudaMalloc(&d_oScaleGrads, outputSize.C * sizeof(float)));
             checkCuda(cudaMalloc(&d_oShiftGrads, outputSize.C * sizeof(float)));
             checkCuda(cudaMalloc(&d_oBatchMean, outputSize.C * sizeof(float)));
             checkCuda(cudaMalloc(&d_oBatchInvVariance, outputSize.C * sizeof(float)));
         }
-        else if (backOn && !trainOn) {
-            backOn = false;
+        else {
             // Free the buffers only needed during training
             checkCuda(cudaFree(d_oBackOutTensor));
             checkCuda(cudaFree(d_oScaleGrads));
@@ -1088,22 +1083,21 @@ public:
             d_oBatchInvVariance = nullptr;
         }
         // Reset the batch sizes to force buffer reallocations in forward pass
-        if (backOn != trainOn) {
-            currBatchSize = 0;
-            currActualBatchSize = 0;
-        }
+        currBatchSize = 0;
+        currActualBatchSize = 0;
     }
 
 
     void initWeights([[maybe_unused]] const size_t seed, [[maybe_unused]] size_t& offset) override {
         // Initialize the scale, shift, running mean and variance to default values
-        initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oScale, 1.0f, outputSize.C);
+        const dim3 gridSize(ceilDiv(outputSize.C, BLOCK_SIZE));
+        initValues<<<gridSize, BLOCK_SIZE>>>(d_oScale, 1.0f, outputSize.C);
         checkCudaLastError();
-        initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oShift, 0.0f, outputSize.C);
+        initValues<<<gridSize, BLOCK_SIZE>>>(d_oShift, 0.0f, outputSize.C);
         checkCudaLastError();
-        initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oRunningMean, 0.0f, outputSize.C);
+        initValues<<<gridSize, BLOCK_SIZE>>>(d_oRunningMean, 0.0f, outputSize.C);
         checkCudaLastError();
-        initValues<<<ceilDiv(outputSize.C, BLOCK_SIZE), BLOCK_SIZE>>>(d_oRunningVar, 1.0f, outputSize.C);
+        initValues<<<gridSize, BLOCK_SIZE>>>(d_oRunningVar, 1.0f, outputSize.C);
         checkCudaLastError();
     }
 
@@ -1397,6 +1391,7 @@ class ConvolutionLayer : public LearnableLayer {
 private:
     bool skipInputGrad;
     size_t filterSize;
+    size_t filtersFullSize;
     float* d_oOutTensor;
     float* d_oFiltersTensor;
     float* d_oFiltersGradTensor;
@@ -1442,6 +1437,7 @@ public:
                 cudnnBwdFilterAlgo(CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1) {
         // Correctly calculate the output size from input size and stride
         outputSize = {outChannels, ceilDiv(inputSize.H, stride), ceilDiv(inputSize.W, stride)};
+        filtersFullSize = outputSize.C * inputSize.C * filterSize * filterSize;
         // Create the cudnn tensor, filter and convolution descriptors
         checkCudnn(cudnnCreateTensorDescriptor(&cudnnInTensorDesc));
         checkCudnn(cudnnCreateTensorDescriptor(&cudnnOutTensorDesc));
@@ -1456,61 +1452,62 @@ public:
             (filterSize - 1) / 2, (filterSize - 1) / 2, stride, stride, 1, 1,
             CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT
         ));
-        // Allocate the output tensor use by both training and inference
-        const size_t filterFullSize = outputSize.C * inputSize.C * filterSize * filterSize;
-        checkCuda(cudaMalloc(&d_oFiltersTensor, filterFullSize * sizeof(float)));
+        // Allocate the filter weight tesnor used by both training and inference
+        checkCuda(cudaMalloc(&d_oFiltersTensor, filtersFullSize * sizeof(float)));
     }
 
 
     void initWeights(const size_t seed, size_t& offset) override {
         const size_t filterInSize = inputSize.C * filterSize * filterSize;
-        const size_t filterFullSize = outputSize.C * filterInSize;
         // He-Normal initialization for the convolution filter weights
         const float range = std::sqrt(2.0f / filterInSize);
-        initRandomValues<true><<<ceilDiv(filterFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
-            d_oFiltersTensor, seed, offset, range, filterFullSize
+        initRandomValues<true><<<ceilDiv(filtersFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_oFiltersTensor, seed, offset, range, filtersFullSize
         );
         checkCudaLastError();
         // Move the offset to prevent correlated random initialization
-        offset += filterFullSize;
+        offset += filtersFullSize;
     }
 
 
     void registerWeights(Optimizer& optimizer) override {
-        if (backOn) {
-            const size_t filterFullSize = outputSize.C * inputSize.C * filterSize * filterSize;
-            optimizer.registerLayer(optimizerAlgorithm, d_oFiltersTensor, d_oFiltersGradTensor, filterFullSize);
-        }
+        if (!backOn) return;
+        optimizer.registerLayer(
+            optimizerAlgorithm,
+            d_oFiltersTensor,
+            d_oFiltersGradTensor,
+            filtersFullSize
+        );
     }
 
 
     void reRegisterGrads(Optimizer& optimizer) override {
-        if (backOn) {
-            optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oFiltersTensor, d_oFiltersGradTensor);
-        }
+        if (!backOn) return;
+        optimizer.reRegisterLayerGrads(
+            optimizerAlgorithm,
+            d_oFiltersTensor,
+            d_oFiltersGradTensor
+        );
     }
 
 
     void toggleTrain(const bool trainOn) override {
-        if (!backOn && trainOn) {
-            backOn = true;
+        if (backOn == trainOn) return;
+        backOn = trainOn;
+        if (trainOn) {
             // Allocate resources independant on batch size
-            const size_t filterFullSize = outputSize.C * inputSize.C * filterSize * filterSize;
-            checkCuda(cudaMalloc(&d_oFiltersGradTensor, filterFullSize * sizeof(float)));
+            checkCuda(cudaMalloc(&d_oFiltersGradTensor, filtersFullSize * sizeof(float)));
         }
-        else if (backOn && !trainOn) {
-            backOn = false;
+        else {
             // Free the buffers only needed during training
             checkCuda(cudaFree(d_oFiltersGradTensor));
             d_oFiltersGradTensor = nullptr;
         }
         // Reset the batch sizes and workspace size
         //  to force buffer reallocations in forward pass
-        if (backOn != trainOn) {
-            currBatchSize = 0;
-            currActualBatchSize = 0;
-            cudnnWorkspaceActualSizeBytes = 0;
-        }
+        currBatchSize = 0;
+        currActualBatchSize = 0;
+        cudnnWorkspaceActualSizeBytes = 0;
     }
 
 
@@ -1688,6 +1685,7 @@ public:
 class LinearLayer : public LearnableLayer {
 private:
     bool skipInputGrad;
+    size_t weightsFullSize;
     float* d_oOutMatrix;
     float* d_oWeightMatrix;
     float* d_oWeightGradMatrix;
@@ -1706,6 +1704,7 @@ public:
             const cublasHandle_t handle):
                 LearnableLayer({inNeurons, 1, 1}, {outNeurons, 1, 1}, algorithm),
                 skipInputGrad(skipInputGrad),
+                weightsFullSize(outNeurons * inNeurons),
                 d_oOutMatrix(nullptr),
                 d_oWeightMatrix(nullptr),
                 d_oWeightGradMatrix(nullptr),
@@ -1714,14 +1713,12 @@ public:
                 d_oBatchOnesVector(nullptr),
                 d_bPrevMatrix(nullptr),
                 cublasHandle(handle) {
-        const size_t weightsFullSize = outputSize.C * inputSize.C;
         checkCuda(cudaMalloc(&d_oWeightMatrix, weightsFullSize * sizeof(float)));
         checkCuda(cudaMalloc(&d_oBiasVector, outputSize.C * sizeof(float)));
     }
 
 
     void initWeights(const size_t seed, size_t& offset) override {
-        const size_t weightsFullSize = outputSize.C * inputSize.C;
         // He-Normal initialization for the linear layer weights
         const float range = std::sqrt(2.0f / inputSize.C);
         initRandomValues<true><<<ceilDiv(weightsFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
@@ -1739,32 +1736,28 @@ public:
 
 
     void registerWeights(Optimizer& optimizer) override {
-        if (backOn) {
-            const size_t weightsFullSize = outputSize.C * inputSize.C;
-            optimizer.registerLayer(optimizerAlgorithm, d_oWeightMatrix, d_oWeightGradMatrix, weightsFullSize);
-            optimizer.registerLayer(optimizerAlgorithm, d_oBiasVector, d_oBiasGradVector, outputSize.C);
-        }
+        if (!backOn) return;
+        optimizer.registerLayer(optimizerAlgorithm, d_oWeightMatrix, d_oWeightGradMatrix, weightsFullSize);
+        optimizer.registerLayer(optimizerAlgorithm, d_oBiasVector, d_oBiasGradVector, outputSize.C);
     }
 
 
     void reRegisterGrads(Optimizer& optimizer) override {
-        if (backOn) {
-            optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oWeightMatrix, d_oWeightGradMatrix);
-            optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oBiasVector, d_oBiasGradVector);
-        }
+        if (!backOn) return;
+        optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oWeightMatrix, d_oWeightGradMatrix);
+        optimizer.reRegisterLayerGrads(optimizerAlgorithm, d_oBiasVector, d_oBiasGradVector);
     }
 
 
     void toggleTrain(const bool trainOn) override {
-        if (!backOn && trainOn) {
-            backOn = true;
+        if (backOn == trainOn) return;
+        backOn = trainOn;
+        if (trainOn) {
             // Allocate resources independant on batch size
-            const size_t weightsFullSize = outputSize.C * inputSize.C;
             checkCuda(cudaMalloc(&d_oWeightGradMatrix, weightsFullSize * sizeof(float)));
             checkCuda(cudaMalloc(&d_oBiasGradVector, outputSize.C * sizeof(float)));
         }
-        else if (backOn && !trainOn) {
-            backOn = false;
+        else {
             // Free the unnecessary memory for inference
             checkCuda(cudaFree(d_oWeightGradMatrix));
             checkCuda(cudaFree(d_oBiasGradVector));
@@ -1773,12 +1766,9 @@ public:
             d_oBiasGradVector = nullptr;
             d_oBatchOnesVector = nullptr;
         }
-        if (backOn != trainOn) {
-            backOn = trainOn;
-            // Reset the batch sizes to force buffer reallocations
-            currBatchSize = 0;
-            currActualBatchSize = 0;
-        }
+        // Reset the batch sizes to force buffer reallocations
+        currBatchSize = 0;
+        currActualBatchSize = 0;
     }
 
 
@@ -1819,6 +1809,7 @@ public:
         broadcastAddBiasInplace<<<ceilDiv(fullOutSize, BLOCK_SIZE), BLOCK_SIZE>>>(
             d_oOutMatrix, d_oBiasVector, outputSize.C, fullOutSize
         );
+        checkCudaLastError();
         // Lend the output matrix with activation data to the next layer
         next->forward(d_oOutMatrix, batchSize);
     }
@@ -1877,5 +1868,116 @@ public:
             checkCuda(cudaFree(d_oBatchOnesVector));
         }
     }
+
+};
+
+
+
+constexpr size_t FILTER_R_SIZE = 3; // template leter (this is just so IDE highlights errors properly)
+constexpr size_t STRIDE = 1; // template leter (this is just so IDE highlights errors properly)
+class DepthwiseConvolutionLayer : public LearnableLayer {
+private:
+    size_t filtersFullSize;
+    float* d_oOutTensor;
+    float* d_oFiltersTensor;
+    float* d_oFiltersGradTensor;
+    float* d_bPrevTensor;
+
+public:
+    DepthwiseConvolutionLayer(const TensorSize inputSize, const Optimizer::OptimAlgo algorithm):
+            LearnableLayer(inputSize, {}, algorithm),
+            filtersFullSize(inputSize.C * FILTER_R_SIZE * FILTER_R_SIZE),
+            d_oOutTensor(nullptr),
+            d_oFiltersTensor(nullptr),
+            d_oFiltersGradTensor(nullptr),
+            d_bPrevTensor(nullptr) {
+        // Correctly calculate the output size from input size and stride
+        outputSize = {inputSize.C, ceilDiv(inputSize.H, STRIDE), ceilDiv(inputSize.W, STRIDE)};
+        // Allocate the output tensor use by both training and inference
+        const size_t filtersFullSize = outputSize.C * FILTER_R_SIZE * FILTER_R_SIZE;
+        checkCuda(cudaMalloc(&d_oFiltersTensor, filtersFullSize * sizeof(float)));
+    }
+
+
+    void initWeights(const size_t seed, size_t& offset) override {
+        // He-Normal initialization for the convolution filter weights
+        const float range = std::sqrt(2.0f / (FILTER_R_SIZE * FILTER_R_SIZE));
+        initRandomValues<true><<<ceilDiv(filtersFullSize, BLOCK_SIZE), BLOCK_SIZE>>>(
+            d_oFiltersTensor, seed, offset, range, filtersFullSize
+        );
+        checkCudaLastError();
+        // Move the offset to prevent correlated random initialization
+        offset += filtersFullSize;
+    }
+
+
+    void registerWeights(Optimizer& optimizer) override {
+        if (!backOn) return;
+        optimizer.registerLayer(
+            optimizerAlgorithm,
+            d_oFiltersTensor,
+            d_oFiltersGradTensor,
+            filtersFullSize
+        );
+    }
+
+
+    void reRegisterGrads(Optimizer& optimizer) override {
+        if (!backOn) return;
+        optimizer.reRegisterLayerGrads(
+            optimizerAlgorithm,
+            d_oFiltersTensor,
+            d_oFiltersGradTensor
+        );
+    }
+
+
+    void toggleTrain(const bool trainOn) override {
+        if (backOn == trainOn) return;
+        backOn = trainOn;
+        if (trainOn) {
+            // Allocate resources independant on batch size
+            checkCuda(cudaMalloc(&d_oFiltersGradTensor, filtersFullSize * sizeof(float)));
+        }
+        else {
+            // Free the buffers only needed during training
+            checkCuda(cudaFree(d_oFiltersGradTensor));
+            d_oFiltersGradTensor = nullptr;
+        }
+        // Reset the batch sizes to force buffer reallocations in forward pass
+        currBatchSize = 0;
+        currActualBatchSize = 0;
+    }
+
+
+    void forward(float* d_inputTensor, const size_t batchSize) override {
+        // Save the borrowed input tensor and batch size for backward pass
+        d_bPrevTensor = d_inputTensor;
+        currBatchSize = batchSize;
+        // Reallocate the owned output tensor only if the actual size is smaller
+        if (currActualBatchSize < batchSize) {
+            currActualBatchSize = batchSize;
+            checkCuda(cudaFree(d_oOutTensor));
+            const size_t fullOutSize = batchSize * outputSize.fullSize();
+            checkCuda(cudaMalloc(&d_oOutTensor, fullOutSize * sizeof(float)));
+        }
+        // Compute the convolution forward pass to the owned output tensor
+        const dim3 blockSize(BLOCK_X_SIZE, BLOCK_Y_SIZE);
+        const size_t outHBlocks = ceilDiv(outputSize.H, BLOCK_Y_SIZE);
+        const dim3 gridSize(ceilDiv(outputSize.W, BLOCK_X_SIZE), batchSize * inputSize.C * outHBlocks);
+        depthwiseConvForward<BLOCK_X_SIZE, BLOCK_Y_SIZE, FILTER_R_SIZE, STRIDE><<<gridSize, blockSize>>>(
+            d_oOutTensor, d_inputTensor, d_oFiltersTensor,
+            inputSize.C, outputSize.H, outputSize.W, outHBlocks,
+            inputSize.H, inputSize.W
+        );
+        checkCudaLastError();
+        // Lend the output tensor with activation data to the next layer
+        next->forward(d_oOutTensor, batchSize);
+    }
+
+
+
+
+
 
 };

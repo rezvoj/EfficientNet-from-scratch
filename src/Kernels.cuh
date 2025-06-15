@@ -4,29 +4,10 @@
 
 
 
-/**
- * @brief Performs a tiled depthwise convolution forward pass.
- *
- * @tparam BLOCK_X_SIZE Number of threads in the x-dimension of a block.
- * @tparam BLOCK_Y_SIZE Number of threads in the y-dimension of a block.
- * @tparam FILTER_SIZE Size of the square convolution filter. Must be an odd number.
- * @tparam STRIDE Stride of the convolution operation.
- *
- * @param outTensor Output tensor in the format [B, C, H_out, W_out].
- * @param inTensor Input tensor in the format [B, C, H_in, W_in].
- * @param inFilters Convolution filters in the format [C, FILTER_SIZE, FILTER_SIZE].
- * @param CSize Number of channels.
- * @param outHSize Height of the output tensor.
- * @param outWSize Width of the output tensor.
- * @param outHBlocks Number of block rows in the output height dimension.
- * @param inHSize Height of the input tensor.
- * @param inWSize Width of the input tensor.
- *
- * @details
- * The grid for this kernel is launched with a 2D configuration:
- * - Grid x-dimension: ceil(outWSize / BLOCK_X_SIZE) blocks.
- * - Grid y-dimension: BSize * CSize * outHBlocks, where outHBlocks = ceil(outHSize / BLOCK_Y_SIZE).
- */
+// Performs a tiled depthwise convolution forward pass
+// The grid for this kernel is launched with a 2D configuration:
+//  x-dimension: ceil(outWSize / BLOCK_X_SIZE) blocks
+//  y-dimension: BSize * CSize * outHBlocks, where outHBlocks = ceil(outHSize / BLOCK_Y_SIZE)
 template <
     int BLOCK_X_SIZE,
     int BLOCK_Y_SIZE,
@@ -34,9 +15,9 @@ template <
     int STRIDE
 > __global__
 void depthwiseConvForward(
-        float* __restrict__ outTensor,
-        const float* __restrict__ inTensor,
-        const float* __restrict__ inFilters,
+        float* __restrict__ outputTensor,
+        const float* __restrict__ inputTensor,
+        const float* __restrict__ filtersTensor,
         const int CSize,
         const int outHSize,
         const int outWSize,
@@ -72,9 +53,8 @@ void depthwiseConvForward(
     const int outHIdx = outLeftoverIdx % outHBlockSize;
     // Load convolution filter to the shared memory
     for (int loadIdx = tInBlockIdx; loadIdx < FILTER_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
-        shFilter[loadIdx] = inFilters[CIdx * FILTER_FULL_SIZE + loadIdx];
+        shFilter[loadIdx] = filtersTensor[CIdx * FILTER_FULL_SIZE + loadIdx];
     }
-    __syncthreads();
     // Calculate in padding offset W and H start indexes for the block
     const int inWStartOffsetIdx = blockIdx.x * BLOCK_X_SIZE * STRIDE - FILTER_PADD_SIZE;
     const int inHStartOffsetIdx = blockIdx.y % outHBlocks * BLOCK_Y_SIZE * STRIDE - FILTER_PADD_SIZE;
@@ -94,7 +74,7 @@ void depthwiseConvForward(
         }
         // Calculate flat input index and load convoluted region cell to shared memory
         const int inLoadIdx = inBCIdxPart + inLoadHIdx * inWSize + inLoadWIdx;
-        shTile[loadIdx] = inTensor[inLoadIdx];
+        shTile[loadIdx] = inputTensor[inLoadIdx];
     }
     __syncthreads();
     // Check bounds for the calculated indexes after loading data
@@ -118,34 +98,15 @@ void depthwiseConvForward(
     // Calculate flat output index and save result
     const int outBCIdxPart = BCIdx * outHSize * outWSize;
     const int tIdx = outBCIdxPart + outHIdx * outWSize + outWIdx;
-    outTensor[tIdx] = convolutionSum;
+    outputTensor[tIdx] = convolutionSum;
 }
 
 
 
-/**
- * @brief Computes the gradient tensor dLoss/dI = expanded dLoss/dO ∗ 180° rotated filter.
- *
- * @tparam BLOCK_X_SIZE Number of threads in the x-dimension of a block.
- * @tparam BLOCK_Y_SIZE Number of threads in the y-dimension of a block.
- * @tparam FILTER_SIZE Size of the original convolution filter.
- * @tparam STRIDE Stride of the original convolution operation.
- *
- * @param outTensor Output tensor dLoss/dI in the format [B, C, H_in, W_in].
- * @param inTensor Non-expanded input tensor dLoss/dO in the format [B, C, H_out, W_out].
- * @param inFilters Convolution filters in the format [C, FILTER_SIZE, FILTER_SIZE].
- * @param CSize Number of channels.
- * @param outHSize Height of the output tensor.
- * @param outWSize Width of the output tensor.
- * @param outHBlocks Number of block rows in the output height dimension.
- * @param inHSize Height of the input tensor.
- * @param inWSize Width of the input tensor.
- *
- * @details
- * The grid for this kernel is launched with a 2D configuration:
- * - Grid x-dimension: ceil(outWSize / BLOCK_X_SIZE) blocks.
- * - Grid y-dimension: BSize * CSize * outHBlocks, where outHBlocks = ceil(outHSize / BLOCK_Y_SIZE).
- */
+// Computes the gradient tensor dLoss/dI from dLoss/dO and filters
+// The grid for this kernel is launched with a 2D configuration:
+//  grid x-dimension: ceil(inWSize / BLOCK_X_SIZE) blocks
+//  grid y-dimension: BSize * CSize * inHBlocks, where inHBlocks = ceil(inHSize / BLOCK_Y_SIZE)
 template <
     int BLOCK_X_SIZE,
     int BLOCK_Y_SIZE,
@@ -153,15 +114,15 @@ template <
     int STRIDE
 > __global__
 void depthwiseConvBackward(
-        float* __restrict__ outTensor,
-        const float* __restrict__ inTensor,
-        const float* __restrict__ inFilters,
+        float* __restrict__ inputGradTensor,
+        const float* __restrict__ outputGradTensor,
+        const float* __restrict__ filtersTensor,
         const int CSize,
-        const int outHSize,
-        const int outWSize,
-        const int outHBlocks,
         const int inHSize,
-        const int inWSize) {
+        const int inWSize,
+        const int inHBlocks,
+        const int outHSize,
+        const int outWSize) {
     static_assert(FILTER_SIZE % 2);
     // Calculate template inferred constants
     constexpr int THREADS_IN_BLOCK = BLOCK_Y_SIZE * BLOCK_X_SIZE;
@@ -177,63 +138,62 @@ void depthwiseConvBackward(
     // Define shared memory for filter an tile
     __shared__ float shFilter[FILTER_FULL_SIZE];
     __shared__ float shTile[TILE_FULL_SIZE];
-    // Calculate W and flat B * C * H out index
-    const int outWIdx = blockIdx.x * BLOCK_X_SIZE + threadIdx.x;
-    const int outBCHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
+    // Calculate W and flat B * C * H in index
+    const int inWIdx = blockIdx.x * BLOCK_X_SIZE + threadIdx.x;
+    const int inBCHIdx = blockIdx.y * BLOCK_Y_SIZE + threadIdx.y;
     // Calculate flat within block index
     const int tInBlockIdx = threadIdx.y * BLOCK_X_SIZE + threadIdx.x;
     // Calculate helper divisor constants
-    const int outHBlockSize = outHBlocks * BLOCK_Y_SIZE;
-    const int outCHBlockSize = CSize * outHBlockSize;
-    // Deconstruct the flat index into B, C and H out indexes
-    const int BIdx = outBCHIdx / outCHBlockSize;
-    const int outLeftoverIdx = outBCHIdx % outCHBlockSize;
-    const int CIdx = outLeftoverIdx / outHBlockSize;
-    const int outHIdx = outLeftoverIdx % outHBlockSize;
+    const int inHBlockSize = inHBlocks * BLOCK_Y_SIZE;
+    const int inCHBlockSize = CSize * inHBlockSize;
+    // Deconstruct the flat index into B, C and H in indexes
+    const int BIdx = inBCHIdx / inCHBlockSize;
+    const int inLeftoverIdx = inBCHIdx % inCHBlockSize;
+    const int CIdx = inLeftoverIdx / inHBlockSize;
+    const int inHIdx = inLeftoverIdx % inHBlockSize;
     // Load convolution filter to the shared memory
     for (int loadIdx = tInBlockIdx; loadIdx < FILTER_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
-        shFilter[loadIdx] = inFilters[CIdx * FILTER_FULL_SIZE + loadIdx];
+        shFilter[loadIdx] = filtersTensor[CIdx * FILTER_FULL_SIZE + loadIdx];
     }
-    __syncthreads();
-    // Calculate in padding offset W and H first needed value indexes for the block
-    const int inWFirstNeededIdx = ceilDiv(static_cast<int>(blockIdx.x) * BLOCK_X_SIZE - FILTER_PADD_SIZE, STRIDE);
-    const int inHFirstNeededIdx = ceilDiv(static_cast<int>(blockIdx.y) % outHBlocks * BLOCK_Y_SIZE - FILTER_PADD_SIZE, STRIDE);
-    // Calculate in B * C flat index part for input indexes
+    // Calculate out padding offset W and H first needed value indexes for the block
+    const int outWFirstNeededIdx = ceilDiv(static_cast<int>(blockIdx.x) * BLOCK_X_SIZE - FILTER_PADD_SIZE, STRIDE);
+    const int outHFirstNeededIdx = ceilDiv(static_cast<int>(blockIdx.y) % inHBlocks * BLOCK_Y_SIZE - FILTER_PADD_SIZE, STRIDE);
+    // Calculate out B * C flat index part for output indexes
     const int BCIdx = BIdx * CSize + CIdx;
-    const int inBCIdxPart = BCIdx * inHSize * inWSize;
+    const int outBCIdxPart = BCIdx * outHSize * outWSize;
     // Load the padded tiles into shared memory
     for (int loadIdx = tInBlockIdx; loadIdx < TILE_FULL_SIZE; loadIdx += THREADS_IN_BLOCK) {
-        // Calculate in H and Y load indexes
-        const int inLoadHIdx = inHFirstNeededIdx + loadIdx / TILE_X_SIZE;
-        const int inLoadWIdx = inWFirstNeededIdx + loadIdx % TILE_X_SIZE;
+        // Calculate out H and Y load indexes
+        const int outLoadHIdx = outHFirstNeededIdx + loadIdx / TILE_X_SIZE;
+        const int outLoadWIdx = outWFirstNeededIdx + loadIdx % TILE_X_SIZE;
         // Use zero padding if out of bounds
-        if (inLoadHIdx < 0 || inLoadHIdx >= inHSize
-                || inLoadWIdx < 0 || inLoadWIdx >= inWSize) {
+        if (outLoadHIdx < 0 || outLoadHIdx >= outHSize
+                || outLoadWIdx < 0 || outLoadWIdx >= outWSize) {
             shTile[loadIdx] = 0.0f;
             continue;
         }
-        // Calculate flat input index and load convoluted region cell to shared memory
-        const int inLoadIdx = inBCIdxPart + inLoadHIdx * inWSize + inLoadWIdx;
-        shTile[loadIdx] = inTensor[inLoadIdx];
+        // Calculate flat output index and load convoluted region cell to shared memory
+        const int outLoadIdx = outBCIdxPart + outLoadHIdx * outWSize + outLoadWIdx;
+        shTile[loadIdx] = outputGradTensor[outLoadIdx];
     }
     __syncthreads();
     // Check bounds for the calculated indexes after loading data
-    if (outHIdx >= outHSize || outWIdx >= outWSize) return;
-    // Calculate top left convolution indexes for the expanded input
-    const int expandedHIdx = outHIdx - FILTER_PADD_SIZE;
-    const int expandedWIdx = outWIdx - FILTER_PADD_SIZE;
-    // Compute inverted convolution on the filter and expanded input region
+    if (inHIdx >= inHSize || inWIdx >= inWSize) return;
+    // Calculate top left convolution indexes for the expanded output
+    const int expandedHIdx = inHIdx - FILTER_PADD_SIZE;
+    const int expandedWIdx = inWIdx - FILTER_PADD_SIZE;
+    // Compute inverted convolution on the filter and expanded output region
     float convolutionSum = 0.0f;
     for (int filterYIdx = 0; filterYIdx < FILTER_SIZE; ++filterYIdx) {
         for (int filterXIdx = 0; filterXIdx < FILTER_SIZE; ++filterXIdx) {
-            // Calculate the current expanded input index offset by the filter
+            // Calculate the current expanded output index offset by the filter
             const int expCurrHIdx = expandedHIdx + filterYIdx;
             const int expCurrWIdx = expandedWIdx + filterXIdx;
             // Check whether the expanded region is occupied with value or not
             if (expCurrHIdx % STRIDE || expCurrWIdx % STRIDE) continue;
             // Calculate where in the shared memory tile is the needed value
-            const int tileYIdx = expCurrHIdx / STRIDE - inHFirstNeededIdx;
-            const int tileXIdx = expCurrWIdx / STRIDE - inWFirstNeededIdx;
+            const int tileYIdx = expCurrHIdx / STRIDE - outHFirstNeededIdx;
+            const int tileXIdx = expCurrWIdx / STRIDE - outWFirstNeededIdx;
             const float regionValue = shTile[tileYIdx * TILE_X_SIZE + tileXIdx];
             // Load the corresponding inverted filter value
             const int invrtFilterYIdx = (FILTER_SIZE - filterYIdx - 1);
@@ -243,19 +203,14 @@ void depthwiseConvBackward(
             convolutionSum += regionValue * filterValue;
         }
     }
-    // Calculate flat output index and save result
-    const int outBCIdxPart = BCIdx * outHSize * outWSize;
-    const int tIdx = outBCIdxPart + outHIdx * outWSize + outWIdx;
-    outTensor[tIdx] = convolutionSum;
+    // Calculate flat input index and save result
+    const int inBCIdxPart = BCIdx * inHSize * inWSize;
+    const int tIdx = inBCIdxPart + inHIdx * inWSize + inWIdx;
+    inputGradTensor[tIdx] = convolutionSum;
 }
 
 
 
-/**
- * @brief Sums up the values for given warp 
- * @param threadValue Value of the single thread in the warp
- * @returns for first thread in the warp the total sum for the warp.
- */
 __forceinline__ __device__ 
 float warpReduceSum(float threadValue) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -266,36 +221,18 @@ float warpReduceSum(float threadValue) {
 
 
 
-/**
- * @brief Computes the batch accumulated gradient tensor dLoss/dK.
- *
- * @tparam BLOCK_SIZE Number of threads in a single block.
- * @tparam FILTER_SIZE Size of the original convolution filter.
- * @tparam STRIDE Stride of the original convolution operation.
- *
- * @param outFilterGrads Output filter gradients in the format [C, FILTER_SIZE, FILTER_SIZE].
- * @param outTensor Output gradient tensor dLoss/dO in the format [B, C, H_out, W_out].
- * @param inTensor Input tensor dI in the format [B, C, H_in, W_in].
- * @param BSize Batch size.
- * @param CSize Number of channels.
- * @param outHWSize Product of height * width of the output tensor.
- * @param outWSize Width of the output tensor.
- * @param inHSize Height of the input tensor.
- * @param inWSize Width of the input tensor.
- *
- * @details
- * The grid for this kernel is launched with a 1D configuration:
- * - Grid x-dimension: CSize * H_fil * W_fil blocks.
- */
+// Accumulates the batch accumulated gradient tensor dLoss/dK
+// The grid for this kernel is launched with a 1D configuration:
+//  x-dimension: CSize * H_fil * W_fil blocks
 template <
     int BLOCK_SIZE,
     int FILTER_SIZE,
     int STRIDE
 > __global__
 void depthwiseConvBackwardGrad(
-        float* __restrict__ outFilterGrads,
-        const float* __restrict__ outTensor,
-        const float* __restrict__ inTensor,
+        float* __restrict__ filterGrads,
+        const float* __restrict__ outputGradTensor,
+        const float* __restrict__ inputTensor,
         const int BSize,
         const int CSize,
         const int outHWSize,
@@ -340,8 +277,8 @@ void depthwiseConvBackwardGrad(
             const int outIdx = outBCIdxPart + outHIdx * outWSize + outWIdx;
             const int inIdx = inBCIdxPart + inHIdx * inWSize + inWIdx;
             // Add the contribution value to the thread's sum
-            const float outValue = outTensor[outIdx];
-            const float inValue = inTensor[inIdx];
+            const float outValue = outputGradTensor[outIdx];
+            const float inValue = inputTensor[inIdx];
             threadValue += outValue * inValue;
         }
     }
@@ -356,9 +293,9 @@ void depthwiseConvBackwardGrad(
     // Warp reduce the only first warp to get the final sum value
     threadValue = tInWarpIdx < WARPS_PER_BLOCK ? shResults[tInWarpIdx] : 0;
     threadValue = warpReduceSum(threadValue);
-    // Save the final value for the whole block
+    // Accumulate the final value for the whole block
     if (threadIdx.x != 0) return;
-    outFilterGrads[blockIdx.x] = threadValue;
+    filterGrads[blockIdx.x] += threadValue;
 }
 
 
