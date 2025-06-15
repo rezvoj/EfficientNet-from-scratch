@@ -2,8 +2,10 @@
 #include <vector>
 #include <string>
 #include <iomanip>
-#include "Kernels.cuh"
-#include "Utils.cuh"
+#include "Convolution.cuh"
+#include "../utils/Exceptions.cuh"
+#include "../utils/Math.cuh"
+#include "../utils/Measuring.cuh"
 
 constexpr int BENCHMARK_ITERATIONS = 100;
 

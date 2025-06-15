@@ -1,6 +1,6 @@
 #pragma once
 #include <stdexcept>
-#include <cudnn.h>
+#include <cudnn_v9.h>
 #include <cublasLt.h>
 
 
@@ -57,31 +57,4 @@ void checkCublas(const cublasStatus_t status) {
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw CublasException(status);
     }
-}
-
-
-__forceinline__
-void cudaStartMeasuringTime(cudaEvent_t* start, cudaEvent_t* stop) {
-    checkCuda(cudaEventCreate(start));
-    checkCuda(cudaEventCreate(stop));
-    checkCuda(cudaEventRecord(*start, 0));
-}
-
-
-__forceinline__
-float cudaStopMeasuringTime(const cudaEvent_t start, const cudaEvent_t stop) {
-    checkCuda(cudaEventRecord(stop, 0));
-    checkCuda(cudaEventSynchronize(stop));
-    float elapsedTime;
-    checkCuda(cudaEventElapsedTime(&elapsedTime, start, stop));
-    checkCuda(cudaEventDestroy(start));
-    checkCuda(cudaEventDestroy(stop));
-    return elapsedTime;
-}
-
-
-template <typename Integer>
-__forceinline__ __host__ __device__
-constexpr Integer ceilDiv(const Integer value, const Integer divisor) {
-    return ((value + divisor - 1) / divisor);
 }

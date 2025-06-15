@@ -5,8 +5,9 @@
 #include <ctime>
 #include <numeric>
 #include <string>
-#include "Kernels.cuh"
-#include "Utils.cuh"
+#include "Convolution.cuh"
+#include "../utils/Exceptions.cuh"
+#include "../utils/Math.cuh"
 
 
 
