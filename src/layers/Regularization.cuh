@@ -30,7 +30,7 @@ public:
             const float rate,
             const uint seed,
             const bool skipInputGrad,
-            const cudnnHandle_t handle): 
+            const cudnnHandle_t handle):
                 Layer(inputSize, inputSize),
                 dropoutRate(rate),
                 dropoutSeed(seed),
